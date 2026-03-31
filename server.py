@@ -175,76 +175,109 @@ class SegmentationPipeline:
         scene = SceneState(timestamp=frame.timestamp)
         result = results[0]
 
-        if result.boxes is None or len(result.boxes) == 0:
-            return scene
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes
+            masks = result.masks
 
-        boxes = result.boxes
-        masks = result.masks
+            for i in range(len(boxes)):
+                box = boxes[i]
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                class_name = self.model.names[cls_id]
+                track_id = int(box.id[0]) if box.id is not None else -1
 
-        for i in range(len(boxes)):
-            box = boxes[i]
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            class_name = self.model.names[cls_id]
-            track_id = int(box.id[0]) if box.id is not None else -1
+                # Bounding box (xyxy normalized)
+                x1, y1, x2, y2 = box.xyxyn[0].tolist()
+                center_x = (x1 + x2) / 2
 
-            # Bounding box (xyxy normalized)
-            x1, y1, x2, y2 = box.xyxyn[0].tolist()
-            center_x = (x1 + x2) / 2
+                # Direction from horizontal position
+                if center_x < 0.33:
+                    direction = "left"
+                elif center_x > 0.66:
+                    direction = "right"
+                else:
+                    direction = "center"
 
-            # Direction from horizontal position
-            if center_x < 0.33:
-                direction = "left"
-            elif center_x > 0.66:
-                direction = "right"
-            else:
-                direction = "center"
+                # Distance from LiDAR depth (using the bilaterally-filtered map)
+                distance = float("inf")
+                if depth is not None and masks is not None:
+                    mask = masks[i].data[0].cpu().numpy()  # (H_mask, W_mask)
+                    # Resize mask to depth map dimensions
+                    dh, dw = depth.shape
+                    mask_resized = cv2.resize(
+                        mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST
+                    )
+                    # Get depth values within the mask
+                    depth_values = depth[mask_resized > 0.5]
+                    depth_values = depth_values[(depth_values > 0.1) & (depth_values < 10)]
+                    if len(depth_values) > 0:
+                        distance = float(np.median(depth_values))
 
-            # Distance from LiDAR depth (using the bilaterally-filtered map)
-            distance = float("inf")
-            if depth is not None and masks is not None:
-                mask = masks[i].data[0].cpu().numpy()  # (H_mask, W_mask)
-                # Resize mask to depth map dimensions
-                dh, dw = depth.shape
-                mask_resized = cv2.resize(
-                    mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST
+                obj = DetectedObject(
+                    class_name=class_name,
+                    track_id=track_id,
+                    confidence=conf,
+                    distance_m=distance,
+                    direction=direction,
+                    bbox=(x1, y1, x2, y2),
+                    mask_area_ratio=(x2 - x1) * (y2 - y1),
                 )
-                # Get depth values within the mask
-                depth_values = depth[mask_resized > 0.5]
-                depth_values = depth_values[(depth_values > 0.1) & (depth_values < 10)]
-                if len(depth_values) > 0:
-                    distance = float(np.median(depth_values))
+                scene.objects.append(obj)
 
-            obj = DetectedObject(
-                class_name=class_name,
-                track_id=track_id,
-                confidence=conf,
-                distance_m=distance,
-                direction=direction,
-                bbox=(x1, y1, x2, y2),
-                mask_area_ratio=(x2 - x1) * (y2 - y1),
-            )
-            scene.objects.append(obj)
+            # Sort objects closest first
+            scene.objects.sort(key=lambda o: o.distance_m)
+            if scene.objects:
+                scene.closest_obstacle_m = scene.objects[0].distance_m
 
-        # Determine free-space direction
-        scene.objects.sort(key=lambda o: o.distance_m)
-        if scene.objects:
-            scene.closest_obstacle_m = scene.objects[0].distance_m
-
-        scene.free_direction = self._estimate_free_direction(scene.objects)
+        # ── Free-space estimation (LiDAR-grid primary, object-based fallback) ──
+        scene.free_direction = self._estimate_free_direction_lidar(
+            depth, scene.objects
+        )
         return scene
 
-    def _estimate_free_direction(self, objects: list) -> str:
+    def _estimate_free_direction_lidar(
+        self,
+        depth: Optional[np.ndarray],
+        objects: list,
+    ) -> str:
         """
-        Simple free-space estimation: find the sector (left/center/right)
-        with the fewest close obstacles.
+        Divide the depth map into left / centre / right thirds and measure
+        the 10th-percentile depth in each sector (lower portion of frame only,
+        where ground-level obstacles matter most).
+
+        Falls back to the object-based heuristic when no depth map is available.
         """
+        if depth is not None:
+            dh, dw = depth.shape
+            # Focus on the lower two-thirds of the frame — that's where obstacles
+            # the user would walk into are most likely to appear.
+            roi = depth[dh // 3 :, :]
+
+            third = dw // 3
+            sectors = {
+                "left":   roi[:, :third],
+                "center": roi[:, third : 2 * third],
+                "right":  roi[:, 2 * third :],
+            }
+
+            clearances: dict[str, float] = {}
+            for name, sector in sectors.items():
+                valid = sector[(sector > 0.1) & (sector < 8.0)]
+                if len(valid) < 10:
+                    # Too few valid readings — assume clear
+                    clearances[name] = 8.0
+                else:
+                    # 10th percentile is robust to noise without being as aggressive
+                    # as the minimum, which is easily skewed by a single bad pixel.
+                    clearances[name] = float(np.percentile(valid, 10))
+
+            return max(clearances, key=clearances.get)
+
+        # ── Fallback: use detected objects when no LiDAR depth is available ──
         sector_min_dist = {"left": 10.0, "center": 10.0, "right": 10.0}
         for obj in objects:
             if obj.distance_m < sector_min_dist[obj.direction]:
                 sector_min_dist[obj.direction] = obj.distance_m
-
-        # Recommend the sector with the most clearance
         return max(sector_min_dist, key=sector_min_dist.get)
 
 
@@ -281,29 +314,96 @@ class ResponseGenerator:
             )
 
     def answer_query(self, scene: SceneState, query: str) -> str:
-        """Answer a spatial query like 'What is to my left?'"""
-        query_lower = query.lower()
+        """
+        Answer a spatial query using the current scene state.
 
-        if "left" in query_lower:
-            filtered = [o for o in scene.objects if o.direction == "left"]
-        elif "right" in query_lower:
-            filtered = [o for o in scene.objects if o.direction == "right"]
-        elif "ahead" in query_lower or "front" in query_lower or "center" in query_lower:
-            filtered = [o for o in scene.objects if o.direction == "center"]
-        else:
-            filtered = scene.objects
+        Handles patterns like:
+          • "What is to my left / right / ahead?"
+          • "What can you see?" / "Describe the scene"
+          • "How far is the <object>?" / "Where is the <object>?"
+          • "Is it safe to go <direction>?"
+          • "Which way should I go?"
+        """
+        q = query.lower().strip(" ?")
 
-        if not filtered:
-            direction_word = "there" if "left" not in query_lower and "right" not in query_lower else query_lower.split()[-1]
-            return f"Nothing detected to your {direction_word}."
+        # ── 1. Direction queries ──────────────────────────────────────
+        direction_map = {
+            "left":   "left",
+            "right":  "right",
+            "ahead":  "center",
+            "front":  "center",
+            "center": "center",
+            "forward": "center",
+            "straight": "center",
+        }
+        target_direction: Optional[str] = None
+        direction_label: str = ""
+        for keyword, dir_val in direction_map.items():
+            if keyword in q:
+                target_direction = dir_val
+                direction_label = keyword
+                break
 
-        descriptions = []
-        for obj in sorted(filtered, key=lambda o: o.distance_m):
-            descriptions.append(
-                f"{obj.class_name} at {obj.distance_m:.1f} metres"
+        if target_direction is not None and any(
+            w in q for w in ("what", "is there", "see", "there", "show", "tell")
+        ):
+            filtered = [o for o in scene.objects if o.direction == target_direction]
+            if not filtered:
+                return f"Nothing detected to your {direction_label}. The path looks clear."
+            items = ", ".join(
+                f"{o.class_name} {o.distance_m:.1f} metres away"
+                for o in sorted(filtered, key=lambda o: o.distance_m)
+            )
+            return f"To your {direction_label} I can see: {items}."
+
+        # ── 2. Safety / navigation queries ────────────────────────────
+        if any(w in q for w in ("safe", "go", "walk", "move", "direction", "which way")):
+            free = scene.free_direction
+            closest = scene.closest_obstacle_m
+            if closest > self.WARN_DISTANCE:
+                return f"The path looks clear. You can proceed {free}."
+            else:
+                return (
+                    f"Caution — closest obstacle is {closest:.1f} metres. "
+                    f"The clearest direction is {free}."
+                )
+
+        # ── 3. Object-specific queries ("how far is the chair") ───────
+        for obj in scene.objects:
+            if obj.class_name.lower() in q:
+                return (
+                    f"The {obj.class_name} is {obj.distance_m:.1f} metres "
+                    f"to your {obj.direction}."
+                )
+
+        # ── 4. General scene description ──────────────────────────────
+        if any(w in q for w in ("see", "around", "scene", "describe", "what is", "what's")):
+            if not scene.objects:
+                return "I don't see any objects right now."
+            items = ", ".join(
+                f"{o.class_name} {o.distance_m:.1f} m {o.direction}"
+                for o in scene.objects[:5]  # cap at 5 to keep response brief
+            )
+            return f"I can see: {items}."
+
+        # ── 5. Closest obstacle ───────────────────────────────────────
+        if any(w in q for w in ("closest", "nearest", "danger", "obstacle")):
+            if not scene.objects:
+                return "No obstacles detected nearby."
+            nearest = scene.objects[0]
+            return (
+                f"The nearest obstacle is a {nearest.class_name} "
+                f"{nearest.distance_m:.1f} metres to your {nearest.direction}."
             )
 
-        return "I can see: " + ", ".join(descriptions) + "."
+        # ── 6. Fallback ───────────────────────────────────────────────
+        if not scene.objects:
+            return "The scene looks clear — no objects detected."
+        items = ", ".join(
+            f"{o.class_name} {o.direction}"
+            for o in scene.objects[:4]
+        )
+        return f"I can see: {items}."
 
 
 # ── Live Visualizer ───────────────────────────────────────────────────
@@ -426,6 +526,8 @@ class GroundSenseServer:
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
         self.visualizer = Visualizer() if visualize else None
+        # Persistent scene state — updated every frame, read by query handler
+        self.last_scene: Optional[SceneState] = None
 
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
@@ -456,6 +558,9 @@ class GroundSenseServer:
         loop = asyncio.get_event_loop()
         scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
 
+        # Persist scene for query handler
+        self.last_scene = scene
+
         # Generate obstacle warning (with cooldown)
         now = time.time()
         response = {"type": "scene_update", "scene": scene.to_dict()}
@@ -481,21 +586,29 @@ class GroundSenseServer:
             )
 
     async def _handle_query(self, websocket, query_json: str):
-        """Handle a voice query from the user."""
+        """Handle a voice query from the user using the last known scene state."""
         try:
             query_data = json.loads(query_json)
             query_text = query_data.get("query", "")
         except json.JSONDecodeError:
             query_text = query_json
 
-        logger.info(f"Voice query: {query_text}")
+        query_text = query_text.strip()
+        logger.info(f"Voice query: '{query_text}'")
 
-        # For now, use the last processed scene state
-        # In production, you'd maintain a persistent scene state
+        if not query_text:
+            return
+
+        if self.last_scene is None:
+            answer = "I haven't processed any frames yet. Please start the camera stream first."
+        else:
+            answer = self.response_gen.answer_query(self.last_scene, query_text)
+
+        logger.info(f"Query answer: '{answer}'")
         response = {
             "type": "query_response",
             "query": query_text,
-            "answer": f"Processing query: {query_text}",
+            "answer": answer,
         }
         await websocket.send(json.dumps(response))
 

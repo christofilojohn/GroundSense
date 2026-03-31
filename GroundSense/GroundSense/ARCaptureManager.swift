@@ -1,13 +1,15 @@
 import Foundation
 import ARKit
 import Combine
+import AVFoundation
+import Speech
 
-/// Manages ARKit session for synchronized RGB + LiDAR depth capture
-/// and streams frames to a backend server for processing.
+/// Manages ARKit session for synchronized RGB + LiDAR depth capture,
+/// WebSocket streaming to the backend, TTS spoken output, and STT voice queries.
 class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
-    
+
     let session = ARSession()
-    
+
     // MARK: - Published State
     @Published var isRunning = false
     @Published var isStreaming = false
@@ -15,12 +17,17 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lastDepthRange: (min: Float, max: Float) = (0, 0)
     @Published var statusMessage: String = "Ready"
 
+    // Voice interface state
+    @Published var isListening = false
+    @Published var lastSpokenText: String = ""
+    @Published var transcribedQuery: String = ""
+
     // MARK: - Configuration
     var serverURL: URL?
     var targetFPS: Int = 10  // Don't need 60fps for assistive use — 10-15 is fine
     var jpegQuality: CGFloat = 0.6
 
-    // MARK: - Internals
+    // MARK: - Internals (streaming)
     private var webSocket: URLSessionWebSocketTask?
     private var urlSession: URLSession?
     private var lastFrameTime: CFTimeInterval = 0
@@ -31,23 +38,53 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     private let ciContext = CIContext()
     // Backpressure: skip encoding if a send is already in flight
     private var isSending = false
-    
+
+    // MARK: - TTS
+    private let speechSynthesizer = AVSpeechSynthesizer()
+    /// Last time a warning was spoken (obstacle-avoidance cooldown).
+    private var lastSpeakTime: CFTimeInterval = 0
+    /// Don't repeat obstacle warnings more than once per this interval (seconds).
+    private let speakCooldown: CFTimeInterval = 2.5
+
+    // MARK: - STT
+    private var speechRecognizer: SFSpeechRecognizer?
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private let audioEngine = AVAudioEngine()
+
     override init() {
         self.frameInterval = 1.0 / Double(10)
         super.init()
         session.delegate = self
+        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     }
-    
+
+    // MARK: - Permission Requests
+
+    /// Call once from the UI (e.g. .onAppear) to prompt the user for mic + speech permissions.
+    func requestPermissions() {
+        SFSpeechRecognizer.requestAuthorization { status in
+            DispatchQueue.main.async {
+                if status != .authorized {
+                    print("Speech recognition not authorized: \(status.rawValue)")
+                }
+            }
+        }
+        AVAudioApplication.requestRecordPermission { granted in
+            if !granted { print("Microphone permission denied") }
+        }
+    }
+
     // MARK: - Session Lifecycle
-    
+
     func startSession() {
         guard ARWorldTrackingConfiguration.isSupported else {
             statusMessage = "ARKit World Tracking not supported on this device"
             return
         }
-        
+
         let config = ARWorldTrackingConfiguration()
-        
+
         // Enable LiDAR scene depth (requires iPhone Pro with LiDAR)
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
@@ -58,7 +95,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         } else {
             statusMessage = "⚠️ LiDAR not available — RGB only mode"
         }
-        
+
         // We want high-res RGB for segmentation
         if let hiResFormat = ARWorldTrackingConfiguration.supportedVideoFormats
             .filter({ $0.captureDevicePosition == .back })
@@ -66,21 +103,22 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             .first {
             config.videoFormat = hiResFormat
         }
-        
+
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         isRunning = true
         startFPSCounter()
     }
-    
+
     func stopSession() {
         session.pause()
         isRunning = false
         disconnectWebSocket()
         fpsTimer?.invalidate()
+        stopListening()
     }
-    
+
     // MARK: - WebSocket Connection
-    
+
     func connectToServer(url: URL) {
         serverURL = url
         urlSession = URLSession(configuration: .default)
@@ -90,7 +128,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         statusMessage = "Connected to \(url.host ?? "server")"
         listenForMessages()
     }
-    
+
     func disconnectWebSocket() {
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
@@ -112,44 +150,197 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
     }
-    
+
     private func handleServerMessage(_ message: URLSessionWebSocketTask.Message) {
-        // Server sends back scene descriptions, obstacle warnings, query responses
         switch message {
         case .string(let text):
-            // Parse JSON response from backend
-            print("Server response: \(text)")
-            // TODO: Route to TTS engine for spoken output
+            guard let data = text.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return }
+
+            let msgType = json["type"] as? String
+
+            if let warning = json["warning"] as? String {
+                // Obstacle warning — goes through cooldown
+                speakWithCooldown(warning)
+            }
+            if msgType == "query_response", let answer = json["answer"] as? String {
+                // Query answers always speak (bypass cooldown)
+                speakForced(answer)
+            }
+
         case .data(let data):
             print("Server binary data: \(data.count) bytes")
         @unknown default:
             break
         }
     }
-    
+
+    // MARK: - TTS
+
+    /// Speak with obstacle-avoidance cooldown (won't fire more often than speakCooldown).
+    func speakWithCooldown(_ text: String) {
+        let now = CACurrentMediaTime()
+        guard now - lastSpeakTime >= speakCooldown else { return }
+        lastSpeakTime = now
+        speakForced(text)
+    }
+
+    /// Speak immediately, bypassing cooldown (for query responses).
+    func speakForced(_ text: String) {
+        // Don't speak over an active STT session
+        guard !isListening else { return }
+
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .word)
+        }
+
+        // Configure audio session for playback
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .default, options: [])
+        try? audioSession.setActive(true)
+
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate  = AVSpeechUtteranceDefaultSpeechRate * 1.05
+        utterance.pitchMultiplier = 1.0
+        utterance.volume = 1.0
+        speechSynthesizer.speak(utterance)
+
+        DispatchQueue.main.async { self.lastSpokenText = text }
+    }
+
+    // MARK: - STT
+
+    /// Start listening for a voice query. Stops TTS if speaking.
+    func startListening() {
+        guard !isListening else { return }
+
+        // Silence TTS before starting mic
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+
+        // Cancel any ongoing recognition task
+        recognitionTask?.cancel()
+        recognitionTask = nil
+
+        // Set up audio session for recording
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("Audio session error: \(error)")
+            return
+        }
+
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let recognitionRequest = recognitionRequest,
+              let speechRecognizer = speechRecognizer,
+              speechRecognizer.isAvailable
+        else {
+            print("Speech recognizer unavailable")
+            return
+        }
+
+        recognitionRequest.shouldReportPartialResults = true
+
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+            guard let self = self else { return }
+
+            if let result = result {
+                let query = result.bestTranscription.formattedString
+                DispatchQueue.main.async { self.transcribedQuery = query }
+
+                if result.isFinal {
+                    self.sendVoiceQuery(query)
+                    self.stopListening()
+                }
+            }
+            if let error = error {
+                print("Recognition error: \(error)")
+                self.stopListening()
+            }
+        }
+
+        // Tap the mic input
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            print("AudioEngine start error: \(error)")
+            stopListening()
+            return
+        }
+
+        DispatchQueue.main.async {
+            self.isListening = true
+            self.transcribedQuery = ""
+        }
+    }
+
+    /// Stop listening and clean up the audio engine + recognition session.
+    func stopListening() {
+        guard audioEngine.isRunning else {
+            DispatchQueue.main.async { self.isListening = false }
+            return
+        }
+
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+
+        // Restore audio session to default so TTS can work again
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+
+        DispatchQueue.main.async { self.isListening = false }
+    }
+
+    /// Send a recognised query string to the backend as a JSON text message.
+    private func sendVoiceQuery(_ query: String) {
+        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        let payload: [String: String] = ["query": query]
+        guard let jsonData = try? JSONEncoder().encode(payload),
+              let jsonString = String(data: jsonData, encoding: .utf8)
+        else { return }
+
+        let socket = webSocket
+        Task { try? await socket?.send(.string(jsonString)) }
+        print("Sent voice query: \(query)")
+    }
+
     // MARK: - ARSessionDelegate — Frame Processing
-    
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
-        
+
         // Throttle to target FPS
         guard now - lastFrameTime >= frameInterval else { return }
         lastFrameTime = now
         frameCount += 1
-        
+
         // Extract RGB image
         let pixelBuffer = frame.capturedImage
-        
+
         // Extract LiDAR depth — prefer smoothedSceneDepth which applies temporal
         // filtering across frames, giving significantly cleaner measurements.
         // Falls back to raw sceneDepth on devices/configs that don't provide it.
         let depthMap = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
-        
+
         // Update depth stats for UI
         if let depthMap = depthMap {
             updateDepthStats(depthMap)
         }
-        
+
         // Stream if connected and not already mid-send (backpressure)
         if isStreaming, !isSending {
             guard let packet = buildPacket(
@@ -167,7 +358,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
     }
-    
+
     // MARK: - Frame Encoding (synchronous — must be called on the AR delegate thread)
 
     /// Encode one ARFrame worth of data into a wire-format packet.
@@ -211,9 +402,9 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
         return packet
     }
-    
+
     // MARK: - Encoding Helpers
-    
+
     private func encodeRGBAsJPEG(_ pixelBuffer: CVPixelBuffer) -> Data? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         // Use the shared CIContext — creating one per frame costs ~10ms
@@ -223,20 +414,20 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         let uiImage = UIImage(cgImage: cgImage)
         return uiImage.jpegData(compressionQuality: jpegQuality)
     }
-    
+
     private func encodeDepthMap(_ depthMap: CVPixelBuffer?) -> Data? {
         guard let depthMap = depthMap else { return nil }
-        
+
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
+
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
         guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
-        
+
         let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
         let count = width * height
-        
+
         // Convert Float32 -> Float16 to halve bandwidth
         var float16Data = Data(count: count * 2)
         float16Data.withUnsafeMutableBytes { rawBuffer in
@@ -245,17 +436,17 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                 f16Buffer[i] = floatToFloat16(floatBuffer[i])
             }
         }
-        
+
         return float16Data
     }
-    
+
     /// IEEE 754 Float32 -> Float16 conversion
     private func floatToFloat16(_ value: Float) -> UInt16 {
         let bits = value.bitPattern
         let sign = (bits >> 16) & 0x8000
         let exponent = Int((bits >> 23) & 0xFF) - 127 + 15
         let mantissa = bits & 0x007FFFFF
-        
+
         if exponent <= 0 {
             return UInt16(sign)  // Flush to zero for very small values
         } else if exponent >= 31 {
@@ -263,21 +454,21 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         }
         return UInt16(sign | UInt32(exponent << 10) | (mantissa >> 13))
     }
-    
+
     private func updateDepthStats(_ depthMap: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
+
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
         guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return }
-        
+
         let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
         let count = width * height
-        
+
         var minDepth: Float = .infinity
         var maxDepth: Float = -.infinity
-        
+
         for i in 0..<count {
             let d = floatBuffer[i]
             if d > 0 && d < 10 {  // Valid range: 0-10 meters
@@ -285,14 +476,14 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                 maxDepth = max(maxDepth, d)
             }
         }
-        
+
         DispatchQueue.main.async {
             self.lastDepthRange = (minDepth, maxDepth)
         }
     }
-    
+
     // MARK: - FPS Counter
-    
+
     private func startFPSCounter() {
         frameCount = 0
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in

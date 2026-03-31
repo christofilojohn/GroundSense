@@ -6,6 +6,14 @@
 	<key>NSCameraUsageDescription</key>
 	<string>GroundSense uses the camera for real-time scene segmentation via ARKit.</string>
 
+	<!-- Microphone access — required for STT voice queries -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>GroundSense listens for voice queries such as "What is to my left?"</string>
+
+	<!-- Speech recognition — required for SFSpeechRecognizer -->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>GroundSense transcribes your voice queries to answer spatial questions about the scene.</string>
+
 	<!-- Local network — required to reach the WebSocket server over Wi-Fi -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>GroundSense connects to a local backend server to process depth and camera frames.</string>
