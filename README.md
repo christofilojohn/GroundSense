@@ -12,7 +12,7 @@ iPhone (LiDAR Pro)          Backend Server
 │  ├─ LiDAR Depth   │       │  ├─ YOLO-Seg Pipeline    │
 │  └─ Streaming     │       │  ├─ Depth Fusion          │
 │                   │◀──WS──│  ├─ Obstacle Avoidance    │
-│  TTS / STT        │       │  └─ Gemini Query Engine   │
+│  TTS / STT        │       │  └─ Response Generator - Gemini/rule-based   │
 └──────────────────┘       └──────────────────────────┘
 ```
 
@@ -78,7 +78,7 @@ Binary WebSocket messages:
 | Segment     | Size    | Format              |
 |-------------|---------|---------------------|
 | JPEG size   | 4 bytes | uint32 LE           |
-| JPEG data   | N bytes | RGB image (BGR)     |
+| JPEG data   | N bytes | RGB image (in BGR)     |
 | Depth size  | 4 bytes | uint32 LE           |
 | Depth data  | M bytes | float16 raw pixels  |
 | Meta size   | 4 bytes | uint32 LE           |
