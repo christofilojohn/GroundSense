@@ -7,6 +7,14 @@ from the iPhone app, runs segmentation, and returns scene descriptions.
 Usage:
     pip install websockets numpy opencv-python-headless pillow ultralytics
     python server.py --host 0.0.0.0 --port 8765
+
+    # With Gemini LLM query engine (default):
+    pip install google-genai
+    export GEMINI_API_KEY=your_key   # or pass --gemini-key
+    python server.py
+
+    # Rule-based only (no API key needed):
+    python server.py --llm none
 """
 
 import asyncio
@@ -19,12 +27,21 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
+import os
+
 import numpy as np
 import cv2
 from PIL import Image
 import io
 import websockets
 
+# Optional Gemini dependency — imported lazily so the server still starts
+# without it when --llm none is passed.
+try:
+    from google import genai as _genai_module
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
 try:
     import qrcode as _qrcode_mod
     HAS_QRCODE = True
@@ -295,6 +312,38 @@ class ResponseGenerator:
     WARN_DISTANCE = 2.0   # meters — warn about objects closer than this
     ALERT_DISTANCE = 1.0  # meters — urgent alert
 
+    # Gemini model used for query answering
+    GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+
+    def __init__(self, llm: str = "gemini", gemini_key: str = ""):
+        """
+        llm       : "gemini" | "none"
+        gemini_key: API key (falls back to GEMINI_API_KEY env var)
+        """
+        self._llm = "none"
+        self._gemini_client = None
+
+        if llm == "gemini":
+            if not _GENAI_AVAILABLE:
+                logger.warning(
+                    "google-genai not installed — falling back to rule-based engine. "
+                    "Run: pip install google-genai"
+                )
+            else:
+                key = gemini_key or os.environ.get("GEMINI_API_KEY", "")
+                if not key:
+                    logger.warning(
+                        "No Gemini API key found. Pass --gemini-key or set GEMINI_API_KEY. "
+                        "Falling back to rule-based engine."
+                    )
+                else:
+                    self._gemini_client = _genai_module.Client(api_key=key)
+                    self._llm = "gemini"
+                    logger.info(f"Gemini query engine active ({self.GEMINI_MODEL})")
+
+        if self._llm == "none":
+            logger.info("Using rule-based query engine.")
+
     def generate_obstacle_warning(self, scene: SceneState) -> Optional[str]:
         """Generate a spoken warning if obstacles are dangerously close."""
         close_objects = [
@@ -319,9 +368,48 @@ class ResponseGenerator:
                 f"in {nearest.distance_m:.1f} metres."
             )
 
-    def answer_query(self, scene: SceneState, query: str) -> str:
+    def answer_query(self, scene: SceneState, query: str) -> tuple[str, str]:
+        """Answer a spatial query. Returns (answer, source) where source is 'gemini' or 'rule-based'."""
+        if self._llm == "gemini":
+            try:
+                return self._gemini_answer(scene, query), "gemini"
+            except Exception as e:
+                logger.warning(f"Gemini call failed ({e}), falling back to rule-based.")
+
+        return self._rule_based_answer(scene, query), "rule-based"
+
+    def _gemini_answer(self, scene: SceneState, query: str) -> str:
+        """Call Gemini with the current scene state as context."""
+        scene_dict = scene.to_dict()
+
+        # Compact scene description to keep the prompt short and latency low
+        if scene_dict["objects"]:
+            obj_lines = "\n".join(
+                f"  - {o['class']} | {o['distance_m']} m | {o['direction']}"
+                for o in scene_dict["objects"][:8]
+            )
+        else:
+            obj_lines = "  (none detected)"
+
+        system_prompt = (
+            "You are a real-time navigation assistant for a visually impaired person. "
+            "Answer in plain spoken English, maximum 2 short sentences. "
+            "Be direct and actionable — the response will be read aloud immediately.\n\n"
+            "Current scene:\n"
+            f"  Free direction to walk: {scene_dict['free_direction']}\n"
+            f"  Closest obstacle: {scene_dict['closest_obstacle_m']} m\n"
+            f"Detected objects:\n{obj_lines}"
+        )
+
+        response = self._gemini_client.models.generate_content(
+            model=self.GEMINI_MODEL,
+            contents=f"{system_prompt}\n\nUser question: {query}",
+        )
+        return response.text.strip()
+
+    def _rule_based_answer(self, scene: SceneState, query: str) -> str:
         """
-        Answer a spatial query using the current scene state.
+        Fallback rule-based engine.
 
         Handles patterns like:
           • "What is to my left / right / ahead?"
@@ -550,9 +638,9 @@ class GroundSenseServer:
     """WebSocket server that processes iPhone frames and returns guidance."""
 
     def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu",
-                 visualize: bool = False):
+                 visualize: bool = False, llm: str = "gemini", gemini_key: str = ""):
         self.pipeline = SegmentationPipeline(model_name=model_name, device=device)
-        self.response_gen = ResponseGenerator()
+        self.response_gen = ResponseGenerator(llm=llm, gemini_key=gemini_key)
         self.frame_count = 0
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
@@ -631,15 +719,16 @@ class GroundSenseServer:
             return
 
         if self.last_scene is None:
-            answer = "I haven't processed any frames yet. Please start the camera stream first."
+            answer, source = "I haven't processed any frames yet. Please start the camera stream first.", "rule-based"
         else:
-            answer = self.response_gen.answer_query(self.last_scene, query_text)
+            answer, source = self.response_gen.answer_query(self.last_scene, query_text)
 
-        logger.info(f"Query answer: '{answer}'")
+        logger.info(f"Query answer [{source}]: '{answer}'")
         response = {
             "type": "query_response",
             "query": query_text,
             "answer": answer,
+            "source": source,
         }
         await websocket.send(json.dumps(response))
 
@@ -792,10 +881,14 @@ async def _serve(host: str, port: int, server: "GroundSenseServer",
         await stop_event.wait()
 
 
-def main(host: str, port: int, model: str, device: str, visualize: bool):
-    server = GroundSenseServer(model_name=model, device=device, visualize=visualize)
+def main(host: str, port: int, model: str, device: str, visualize: bool,
+         llm: str, gemini_key: str):
+    server = GroundSenseServer(
+        model_name=model, device=device, visualize=visualize,
+        llm=llm, gemini_key=gemini_key,
+    )
     logger.info(f"Starting GroundSense server on ws://{host}:{port}")
-    logger.info(f"Model: {model} | Device: {device}"
+    logger.info(f"Model: {model} | Device: {device} | LLM: {llm}"
                 + (" | Visualizer: ON  (press q to quit)" if visualize else ""))
 
     if visualize:
@@ -856,10 +949,25 @@ if __name__ == "__main__":
     parser.add_argument("--host",   default="0.0.0.0",       help="Bind address")
     parser.add_argument("--port",   type=int, default=8765,   help="WebSocket port")
     parser.add_argument("--model",  default="yolo11n-seg.pt", help="YOLO model name")
-    parser.add_argument("--device", default="cpu",
-                        help="Inference device: cpu | cuda | mps")
+    parser.add_argument("--device", default=None,
+                        help="Inference device: cuda | mps | cpu (auto-detected if omitted)")
     parser.add_argument("--visualize", action="store_true",
                         help="Open a live OpenCV window (requires opencv-python, not headless)")
+    parser.add_argument("--llm", default="gemini", choices=["gemini", "none"],
+                        help="Query engine: gemini (default) | none (rule-based)")
+    parser.add_argument("--gemini-key", default="",
+                        help="Gemini API key (overrides GEMINI_API_KEY env var)")
     args = parser.parse_args()
 
-    main(args.host, args.port, args.model, args.device, args.visualize)
+    if args.device is None:
+        import torch
+        if torch.cuda.is_available():
+            args.device = "cuda"
+        elif torch.backends.mps.is_available():
+            args.device = "mps"
+        else:
+            args.device = "cpu"
+        logger.info(f"Auto-selected device: {args.device}")
+
+    main(args.host, args.port, args.model, args.device, args.visualize,
+         args.llm, args.gemini_key)

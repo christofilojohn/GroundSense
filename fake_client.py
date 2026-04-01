@@ -210,6 +210,63 @@ def save_preview(dataset: NyuDataset, idx: int = 0):
 
 # ── WebSocket streaming ──────────────────────────────────────────────
 
+async def stream(
+    server: str,
+    dataset: NyuDataset,
+    fps: float,
+    start: int,
+    count: int,
+):
+    end = min(start + count, len(dataset))
+    interval = 1.0 / fps
+
+    log.info(f"Connecting to {server} …")
+    async with websockets.connect(server, max_size=10 * 1024 * 1024) as ws:
+        log.info(f"Connected. Streaming frames {start}–{end - 1} at {fps:.1f} fps")
+
+        for i in range(start, end):
+            rgb, depth = dataset[i]
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)  # server expects BGR
+
+            t0 = time.time()
+            packet = pack_frame(bgr, depth, i)
+            await ws.send(packet)
+
+            # Read server response
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=8.0)
+                resp = json.loads(raw)
+
+                if resp.get("type") == "scene_update":
+                    scene = resp["scene"]
+                    objs  = scene["objects"]
+                    free  = scene["free_direction"]
+                    close = scene["closest_obstacle_m"]
+
+                    obj_str = "  ".join(
+                        f"{o['class']} {o['distance_m']}m {o['direction']}"
+                        for o in objs[:4]
+                    ) or "(none)"
+                    log.info(
+                        f"  [{i:4d}] {len(objs)} obj | free={free} | "
+                        f"closest={close:.1f}m | {obj_str}"
+                    )
+                    if "warning" in resp:
+                        log.warning(f"  ⚠  {resp['warning']}")
+
+                else:
+                    log.info(f"  [{i:4d}] server: {raw[:120]}")
+
+            except asyncio.TimeoutError:
+                log.warning(f"  [{i:4d}] no response within 8 s")
+
+            # Throttle to target FPS
+            wait = interval - (time.time() - t0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        log.info("Stream finished.")
+        return ws   # caller may reuse for interactive queries
 
 
 async def interactive_query(ws, initial_query: str = "", display: bool = False,
