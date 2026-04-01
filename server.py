@@ -42,6 +42,11 @@ try:
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
+try:
+    import qrcode as _qrcode_mod
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("groundsense")
@@ -154,7 +159,7 @@ class SegmentationPipeline:
     Fuses with LiDAR depth for distance estimation.
     """
 
-    def __init__(self, model_name: str = "yolo11n-seg.pt", device: str = "cpu"):
+    def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu"):
         from ultralytics import YOLO
         logger.info(f"Loading YOLO model: {model_name} on {device}")
         self.model = YOLO(model_name)
@@ -510,6 +515,8 @@ class Visualizer:
     _WARN  = 2.0   # metres
     _ALERT = 1.0
 
+    _DISPLAY_H = 640   # target display height per panel (px)
+
     def __init__(self):
         self._lock = threading.Lock()
         self._pending = None          # (frame, scene) set by asyncio thread
@@ -528,6 +535,11 @@ class Visualizer:
         Called from the MAIN thread only.
         Draws the latest frame and pumps the OpenCV event loop.
         Returns False when the user presses 'q'.
+
+        The iPhone ARKit sensor delivers frames in *landscape* pixel format even
+        when the phone is held in portrait.  We rotate 90° CW here so the preview
+        matches how the user holds the device.  Bounding-box normalised coords are
+        transformed accordingly: landscape (nx,ny) → rotated (1-ny, nx).
         """
         with self._lock:
             data = self._pending
@@ -535,7 +547,8 @@ class Visualizer:
 
         if not self._window_ready:
             cv2.namedWindow("GroundSense", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("GroundSense", 1280, 480)
+            # Portrait panel × 2 side-by-side
+            cv2.resizeWindow("GroundSense", self._DISPLAY_H * 2, int(self._DISPLAY_H * 1.5))
             self._window_ready = True
 
         if data is not None:
@@ -550,15 +563,25 @@ class Visualizer:
                 self._frame_idx = 0
                 self._fps_time = now
 
-            rgb = frame.rgb.copy()
-            h, w = rgb.shape[:2]
+            # ── Rotate 90° CW to match portrait phone orientation ────
+            rgb = cv2.rotate(frame.rgb, cv2.ROTATE_90_CLOCKWISE)
+
+            # Scale to a fixed display height so the window stays manageable
+            h_orig, w_orig = rgb.shape[:2]
+            dh = self._DISPLAY_H
+            dw = int(w_orig * dh / h_orig)
+            rgb = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_LINEAR)
+            h, w = rgb.shape[:2]   # now equals (dh, dw)
 
             # ── YOLO bounding boxes + labels ─────────────────────────
-            # bbox is stored as normalised (0-1); scale to pixel coords here.
+            # Original bbox is in landscape-normalised coords (nx1,ny1,nx2,ny2).
+            # After ROTATE_90_CLOCKWISE: (nx,ny) → (1-ny, nx).
+            # New bbox corners: (1-ny2, nx1, 1-ny1, nx2).
             for obj in scene.objects:
                 nx1, ny1, nx2, ny2 = obj.bbox
-                x1, y1 = int(nx1 * w), int(ny1 * h)
-                x2, y2 = int(nx2 * w), int(ny2 * h)
+                rx1, ry1, rx2, ry2 = 1.0 - ny2, nx1, 1.0 - ny1, nx2
+                x1, y1 = int(rx1 * w), int(ry1 * h)
+                x2, y2 = int(rx2 * w), int(ry2 * h)
                 if obj.distance_m < self._ALERT:
                     colour = (0, 0, 220)
                 elif obj.distance_m < self._WARN:
@@ -579,13 +602,13 @@ class Visualizer:
             cv2.putText(rgb, hud, (8, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # ── Depth heatmap ────────────────────────────────────────
+            # ── Depth heatmap (also rotated to match) ────────────────
             if frame.depth is not None:
                 d = np.clip(frame.depth, 0.0, 10.0)
                 d_norm = (d / 10.0 * 255).astype(np.uint8)
                 depth_colour = cv2.applyColorMap(d_norm, cv2.COLORMAP_PLASMA)
-                # INTER_CUBIC gives smoother upsampling from LiDAR's low native res
-                depth_colour = cv2.resize(depth_colour, (w, h),
+                depth_colour = cv2.rotate(depth_colour, cv2.ROTATE_90_CLOCKWISE)
+                depth_colour = cv2.resize(depth_colour, (dw, dh),
                                           interpolation=cv2.INTER_CUBIC)
                 cv2.putText(depth_colour, "depth  (0 m \u2192 10 m)", (8, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
@@ -726,6 +749,26 @@ def _get_local_ips() -> dict:
     return ips
 
 
+def _get_best_url(port: int) -> str:
+    """Return the single best WebSocket URL to advertise (hotspot > USB > Wi-Fi)."""
+    ips = _get_local_ips()
+    best_ip: Optional[str] = None
+    for iface, ip in ips.items():
+        if ip.startswith("192.168.2."):          # Mac hotspot
+            best_ip = ip; break
+    if best_ip is None:
+        for iface, ip in ips.items():
+            if "bridge" in iface or iface in ("en5","en6","en7","en8"):  # USB
+                best_ip = ip; break
+    if best_ip is None:
+        for iface, ip in ips.items():
+            if iface.startswith("en0") or iface.startswith("en1"):  # Wi-Fi
+                best_ip = ip; break
+    if best_ip is None and ips:
+        best_ip = next(iter(ips.values()))
+    return f"ws://{best_ip}:{port}" if best_ip else ""
+
+
 def _print_connection_guide(port: int):
     """Print a startup banner showing every reachable address and how to use them."""
     ips = _get_local_ips()
@@ -785,6 +828,36 @@ def _print_connection_guide(port: int):
     logger.info("     Note: the WebSocket is local; no cellular data is used")
     logger.info("═" * 62)
 
+    # ── ASCII QR code for the best available address ─────────────────
+    best_url = _get_best_url(port)
+    if best_url and HAS_QRCODE:
+        try:
+            import io as _io
+            qr = _qrcode_mod.QRCode(box_size=1, border=2)
+            qr.add_data(best_url)
+            qr.make(fit=True)
+            buf = _io.StringIO()
+            try:
+                qr.print_ascii(out=buf, invert=True)
+            except TypeError:
+                # older qrcode versions don't have invert=
+                qr.print_ascii(out=buf)
+            lines = buf.getvalue().splitlines()
+            print("", flush=True)
+            print(f"  ┌─ Scan to connect ─────────────────────────────────┐", flush=True)
+            print(f"  │  {best_url}", flush=True)
+            print(f"  └───────────────────────────────────────────────────┘", flush=True)
+            for line in lines:
+                print("  " + line, flush=True)
+            print("", flush=True)
+        except Exception as e:
+            print(f"\n  QR URL: {best_url}\n  (QR render failed: {e})\n", flush=True)
+    elif best_url:
+        print(f"\n  ┌──────────────────────────────────────────────────────┐", flush=True)
+        print(f"  │  Connect URL: {best_url}", flush=True)
+        print(f"  │  Install qrcode for a scannable QR: pip install 'qrcode[pil]'", flush=True)
+        print(f"  └──────────────────────────────────────────────────────┘\n", flush=True)
+
 
 # ── Entry point ───────────────────────────────────────────────────────
 
@@ -813,25 +886,39 @@ def main(host: str, port: int, model: str, device: str, visualize: bool,
 
     if visualize:
         # ── asyncio runs in a background thread; main thread owns OpenCV ──
+        #
+        # Python 3.9 bug: asyncio.Event() binds to the *current* loop at
+        # construction time.  Creating it in the main thread (before the
+        # background loop is set) attaches it to the wrong loop and raises
+        # "Future attached to a different loop" at runtime.
+        #
+        # Fix: create stop_event *inside* the background thread after
+        # set_event_loop(), then hand it back via a mutable list + a
+        # threading.Event that gates the main thread until it's ready.
         loop = asyncio.new_event_loop()
-        stop_event = asyncio.Event()
+        _ready      = threading.Event()   # set once asyncio.Event is created
+        _stop_holder: list = []           # [asyncio.Event] — filled by thread
 
         def _run_loop():
             asyncio.set_event_loop(loop)
+            stop_event = asyncio.Event()  # now bound to the correct loop
+            _stop_holder.append(stop_event)
+            _ready.set()                  # unblock main thread
             loop.run_until_complete(_serve(host, port, server, stop_event))
 
         t = threading.Thread(target=_run_loop, daemon=True)
         t.start()
+        _ready.wait()                     # wait until stop_event exists
 
         # Main thread: OpenCV render loop (~60 Hz)
         vis = server.visualizer
         try:
             while True:
-                if not vis.render():          # returns False when 'q' pressed
+                if not vis.render():      # returns False when 'q' pressed
                     break
                 time.sleep(0.016)
         finally:
-            loop.call_soon_threadsafe(stop_event.set)
+            loop.call_soon_threadsafe(_stop_holder[0].set)
             vis.close()
             t.join(timeout=3)
     else:

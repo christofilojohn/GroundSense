@@ -21,6 +21,12 @@
 - [x] Live OpenCV visualiser: RGB + YOLO overlays + depth heatmap side-by-side
 - [x] Startup banner showing all reachable network addresses
 
+### Week 3 — QR Connect & Live View Orientation
+- [x] **QR code at startup** — `qrcode` library; ASCII QR printed to terminal showing the best WebSocket URL (hotspot > USB > Wi-Fi); `_get_best_url()` helper picks the right IP automatically
+- [x] **OpenCV QR overlay** — 160×160 QR image composited into top-right corner of the RGB panel in `--visualize` mode; lazily generated and cached; graceful fallback if `qrcode` not installed
+- [x] **Portrait rotation in live view** — `cv2.ROTATE_90_CLOCKWISE` applied to both RGB and depth panels; bounding-box normalised coords transformed `(nx,ny) → (1-ny, nx)` for correct overlay position; window resized to portrait aspect
+- [x] **iOS QR scanner** — removed hardcoded IP constants; replaced preset buttons with "Scan Server QR Code" button; `QRScannerView` / `QRScannerViewController` use `AVCaptureMetadataOutput`; accepts `ws://` or `wss://` URLs only; auto-fills address field on scan
+
 ### Week 2 — Depth Fusion, Obstacle Avoidance & Voice Interface
 - [x] **LiDAR-grid free-space estimation** — raw depth map divided into left/centre/right thirds (lower ⅔ of frame), 10th-percentile clearance per sector; robust to noise and catches obstacles YOLO misses
 - [x] Object-based free-direction fallback (used when no depth map available)
@@ -38,7 +44,7 @@
 
 ## 🔲 To Do
 
-### Week 3 — Open-Vocabulary Extension & End-to-End Polish
+### Week 4 — Open-Vocabulary Extension & End-to-End Polish
 - [ ] **MobileSAM + Grounding DINO pipeline** (optional extension)
   - [ ] Integrate `groundingdino` for text-prompted object detection
   - [ ] Integrate `mobile_sam` for mask generation on detected boxes

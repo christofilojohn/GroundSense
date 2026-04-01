@@ -1,21 +1,11 @@
 import SwiftUI
 import ARKit
-
-// ── Server address presets ───────────────────────────────────────────
-//
-// Hotspot: Mac creates its own Wi-Fi in System Settings → Sharing → Internet Sharing.
-//          iPhone joins it. No router, no data, no cable. Server IP is always 192.168.2.1.
-//
-// USB:     iPhone Personal Hotspot ON + cable. Server IP is always 172.20.10.2.
-//          The WebSocket is local — zero cellular data is used either way.
-//
-private let kHotspotAddress = "ws://192.168.2.1:8765"
-private let kUSBAddress     = "ws://172.20.10.2:8765"
-private let kWiFiAddress    = "ws://192.168.1.100:8765"  // replace with Mac's Wi-Fi IP
+import AVFoundation
 
 struct ContentView: View {
     @StateObject private var captureManager = ARCaptureManager()
-    @State private var serverAddress: String = kHotspotAddress
+    @State private var serverAddress: String = ""
+    @State private var showQRScanner: Bool = false
 
     var body: some View {
         ZStack {
@@ -52,6 +42,23 @@ struct ContentView: View {
                                 .foregroundColor(.white)
                         }
                         Spacer()
+                        // Depth smoothing toggle
+                        Button(action: { captureManager.depthSmoothing.toggle() }) {
+                            HStack(spacing: 5) {
+                                Image(systemName: captureManager.depthSmoothing
+                                      ? "waveform.path.ecg" : "waveform")
+                                    .font(.caption)
+                                Text(captureManager.depthSmoothing ? "Smoothed" : "Raw")
+                                    .font(.caption.weight(.medium))
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(captureManager.depthSmoothing
+                                        ? Color.blue.opacity(0.7)
+                                        : Color.white.opacity(0.15))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
                     }
                     .padding(.horizontal)
                     .padding(.bottom, 8)
@@ -60,13 +67,17 @@ struct ContentView: View {
                 // ── Bottom controls ──────────────────────────────────
                 BottomControls(
                     captureManager: captureManager,
-                    serverAddress: $serverAddress
+                    serverAddress: $serverAddress,
+                    showQRScanner: $showQRScanner
                 )
             }
         }
         .preferredColorScheme(.dark)
         .onAppear {
             captureManager.requestPermissions()
+        }
+        .sheet(isPresented: $showQRScanner) {
+            QRScannerSheet(isPresented: $showQRScanner, scannedAddress: $serverAddress)
         }
     }
 }
@@ -138,6 +149,7 @@ private struct WarningBanner: View {
 private struct BottomControls: View {
     @ObservedObject var captureManager: ARCaptureManager
     @Binding var serverAddress: String
+    @Binding var showQRScanner: Bool
 
     var body: some View {
         VStack(spacing: 12) {
@@ -145,9 +157,14 @@ private struct BottomControls: View {
             // STT transcript feedback (shows while listening)
             if captureManager.isListening {
                 HStack {
-                    Image(systemName: "waveform")
-                        .foregroundColor(.cyan)
-                        .symbolEffect(.pulse)
+                    if #available(iOS 17.0, *) {
+                        Image(systemName: "waveform")
+                            .foregroundColor(.cyan)
+                            .symbolEffect(.pulse)
+                    } else {
+                        Image(systemName: "waveform")
+                            .foregroundColor(.cyan)
+                    }
                     Text(captureManager.transcribedQuery.isEmpty
                          ? "Listening…"
                          : captureManager.transcribedQuery)
@@ -161,14 +178,15 @@ private struct BottomControls: View {
                 .cornerRadius(10)
             }
 
-            // Quick-pick transport
-            HStack(spacing: 8) {
-                PresetButton(label: "Hotspot", icon: "personalhotspot",
-                             address: kHotspotAddress, current: $serverAddress)
-                PresetButton(label: "USB",     icon: "cable.connector",
-                             address: kUSBAddress,     current: $serverAddress)
-                PresetButton(label: "Wi-Fi",   icon: "wifi",
-                             address: kWiFiAddress,    current: $serverAddress)
+            // QR scan button
+            Button(action: { showQRScanner = true }) {
+                Label("Scan Server QR Code", systemImage: "qrcode.viewfinder")
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.white.opacity(0.15))
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
             }
 
             // Server address field
@@ -263,29 +281,6 @@ private struct BottomControls: View {
     }
 }
 
-// MARK: - Preset address button
-
-struct PresetButton: View {
-    let label: String
-    let icon: String
-    let address: String
-    @Binding var current: String
-
-    var isActive: Bool { current == address }
-
-    var body: some View {
-        Button(action: { current = address }) {
-            Label(label, systemImage: icon)
-                .font(.subheadline.weight(.medium))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(isActive ? Color.blue : Color.white.opacity(0.15))
-                .foregroundColor(.white)
-                .cornerRadius(10)
-        }
-    }
-}
-
 // MARK: - AR View Container (UIKit bridge)
 
 struct ARViewContainer: UIViewRepresentable {
@@ -301,6 +296,144 @@ struct ARViewContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {}
+}
+
+// MARK: - QR Scanner Sheet
+
+/// A modal sheet that wraps the camera-based QR scanner.
+struct QRScannerSheet: View {
+    @Binding var isPresented: Bool
+    @Binding var scannedAddress: String
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                QRScannerView { scanned in
+                    // Only accept ws:// URLs
+                    if scanned.hasPrefix("ws://") || scanned.hasPrefix("wss://") {
+                        scannedAddress = scanned
+                        isPresented = false
+                    }
+                }
+                .ignoresSafeArea()
+
+                // Viewfinder guide overlay
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.8), lineWidth: 2)
+                    .frame(width: 220, height: 220)
+
+                VStack {
+                    Spacer()
+                    Text("Point at the QR code shown in the server terminal")
+                        .font(.caption)
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(10)
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(8)
+                        .padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("Scan Server QR")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Cancel") { isPresented = false }
+                        .foregroundColor(.white)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - QR Scanner View (AVFoundation bridge)
+
+/// UIViewControllerRepresentable that uses AVCaptureMetadataOutput to scan QR codes.
+struct QRScannerView: UIViewControllerRepresentable {
+    let onScan: (String) -> Void
+
+    func makeUIViewController(context: Context) -> QRScannerViewController {
+        let vc = QRScannerViewController()
+        vc.onScan = onScan
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: QRScannerViewController, context: Context) {}
+}
+
+final class QRScannerViewController: UIViewController,
+                                     AVCaptureMetadataOutputObjectsDelegate {
+
+    var onScan: ((String) -> Void)?
+
+    private var captureSession: AVCaptureSession?
+    private var previewLayer: AVCaptureVideoPreviewLayer?
+    private var didScan = false   // fire onScan only once per presentation
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        setupSession()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        didScan = false
+        if captureSession?.isRunning == false {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.captureSession?.startRunning()
+            }
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        if captureSession?.isRunning == true {
+            captureSession?.stopRunning()
+        }
+    }
+
+    private func setupSession() {
+        let session = AVCaptureSession()
+        guard let device = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else { return }
+
+        session.addInput(input)
+
+        let output = AVCaptureMetadataOutput()
+        guard session.canAddOutput(output) else { return }
+        session.addOutput(output)
+        output.setMetadataObjectsDelegate(self, queue: .main)
+        output.metadataObjectTypes = [.qr]
+
+        let preview = AVCaptureVideoPreviewLayer(session: session)
+        preview.frame = view.bounds
+        preview.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(preview)
+        self.previewLayer = preview
+        self.captureSession = session
+
+        DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
+    }
+
+    // AVCaptureMetadataOutputObjectsDelegate
+    func metadataOutput(_ output: AVCaptureMetadataOutput,
+                        didOutput metadataObjects: [AVMetadataObject],
+                        from connection: AVCaptureConnection) {
+        guard !didScan,
+              let obj = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              let str = obj.stringValue else { return }
+        didScan = true
+        captureSession?.stopRunning()
+        onScan?(str)
+    }
 }
 
 #Preview {
