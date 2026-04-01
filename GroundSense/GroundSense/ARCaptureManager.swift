@@ -26,6 +26,8 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     var serverURL: URL?
     var targetFPS: Int = 10  // Don't need 60fps for assistive use — 10-15 is fine
     var jpegQuality: CGFloat = 0.6
+    /// When true, uses ARKit's temporally smoothed depth map; false = raw per-frame depth.
+    @Published var depthSmoothing: Bool = true
 
     // MARK: - Internals (streaming)
     private var webSocket: URLSessionWebSocketTask?
@@ -70,8 +72,12 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                 }
             }
         }
-        AVAudioApplication.requestRecordPermission { granted in
-            if !granted { print("Microphone permission denied") }
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { granted in
+                if !granted { print("Microphone permission denied") }
+            }
+        } else {
+            // Fallback on earlier versions
         }
     }
 
@@ -331,10 +337,15 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         // Extract RGB image
         let pixelBuffer = frame.capturedImage
 
-        // Extract LiDAR depth — prefer smoothedSceneDepth which applies temporal
-        // filtering across frames, giving significantly cleaner measurements.
-        // Falls back to raw sceneDepth on devices/configs that don't provide it.
-        let depthMap = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+        // Extract LiDAR depth — use smoothed or raw depending on user toggle.
+        // Smoothed applies temporal filtering across frames (cleaner but adds ~1 frame lag).
+        // Raw gives the latest unfiltered LiDAR reading.
+        let depthMap: CVPixelBuffer?
+        if depthSmoothing {
+            depthMap = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+        } else {
+            depthMap = frame.sceneDepth?.depthMap ?? frame.smoothedSceneDepth?.depthMap
+        }
 
         // Update depth stats for UI
         if let depthMap = depthMap {
