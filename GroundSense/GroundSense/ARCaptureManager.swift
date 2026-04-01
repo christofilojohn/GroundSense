@@ -3,6 +3,7 @@ import ARKit
 import Combine
 import AVFoundation
 import Speech
+import Accelerate
 
 /// Manages ARKit session for synchronized RGB + LiDAR depth capture,
 /// WebSocket streaming to the backend, TTS spoken output, and STT voice queries.
@@ -24,7 +25,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // MARK: - Configuration
     var serverURL: URL?
-    var targetFPS: Int = 10  // Don't need 60fps for assistive use — 10-15 is fine
+    var targetFPS: Int = 20  // Assistive use — 20fps gives smoother obstacle detection
     var jpegQuality: CGFloat = 0.6
     /// When true, uses ARKit's temporally smoothed depth map; false = raw per-frame depth.
     @Published var depthSmoothing: Bool = true
@@ -37,9 +38,11 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     private var frameCount = 0
     private var fpsTimer: Timer?
     // Reuse CIContext across frames — creating one per frame is expensive
-    private let ciContext = CIContext()
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     // Backpressure: skip encoding if a send is already in flight
     private var isSending = false
+    // Dedicated queue for JPEG/depth encoding — keeps ARKit delegate queue free
+    private let encodeQueue = DispatchQueue(label: "com.groundsense.encode", qos: .userInteractive)
 
     // MARK: - TTS
     private let speechSynthesizer = AVSpeechSynthesizer()
@@ -55,7 +58,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     private let audioEngine = AVAudioEngine()
 
     override init() {
-        self.frameInterval = 1.0 / Double(10)
+        self.frameInterval = 1.0 / Double(targetFPS)
         super.init()
         session.delegate = self
         speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -102,12 +105,15 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             statusMessage = "⚠️ LiDAR not available — RGB only mode"
         }
 
-        // We want high-res RGB for segmentation
-        if let hiResFormat = ARWorldTrackingConfiguration.supportedVideoFormats
-            .filter({ $0.captureDevicePosition == .back })
-            .sorted(by: { $0.imageResolution.width > $1.imageResolution.width })
+        // Target ~1280px wide — the server downscales to 640px anyway, so 12MP buys nothing.
+        // Smaller frame = ~10x faster JPEG encode, frees the ARKit delegate queue.
+        let backFormats = ARWorldTrackingConfiguration.supportedVideoFormats
+            .filter { $0.captureDevicePosition == .back }
+        let targetWidth: CGFloat = 1280
+        if let bestFormat = backFormats
+            .sorted(by: { abs($0.imageResolution.width - targetWidth) < abs($1.imageResolution.width - targetWidth) })
             .first {
-            config.videoFormat = hiResFormat
+            config.videoFormat = bestFormat
         }
 
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
@@ -352,30 +358,37 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             updateDepthStats(depthMap)
         }
 
-        // Stream if connected and not already mid-send (backpressure)
+        // Stream if connected and not already mid-encode/send (backpressure)
         if isStreaming, !isSending {
-            guard let packet = buildPacket(
-                rgb: pixelBuffer,
-                depth: depthMap,
-                timestamp: now,
-                intrinsics: frame.camera.intrinsics
-            ) else { return }
-
             isSending = true
+            // Retain the ARFrame (not CVPixelBuffer directly) to avoid ARKit buffer pool starvation.
+            // Encoding is moved off the delegate queue so ARKit can deliver the next frame immediately.
+            let capturedFrame = frame
             let socket = webSocket
-            Task {
-                defer { isSending = false }
-                try? await socket?.send(.data(packet))
+            encodeQueue.async { [weak self] in
+                guard let self = self else { return }
+                guard let packet = self.buildPacket(
+                    rgb: capturedFrame.capturedImage,
+                    depth: capturedFrame.smoothedSceneDepth?.depthMap ?? capturedFrame.sceneDepth?.depthMap,
+                    timestamp: now,
+                    intrinsics: capturedFrame.camera.intrinsics
+                ) else {
+                    self.isSending = false
+                    return
+                }
+                Task {
+                    defer { self.isSending = false }
+                    try? await socket?.send(.data(packet))
+                }
             }
         }
     }
 
-    // MARK: - Frame Encoding (synchronous — must be called on the AR delegate thread)
+    // MARK: - Frame Encoding (runs on encodeQueue, not the ARKit delegate thread)
 
     /// Encode one ARFrame worth of data into a wire-format packet.
-    /// Returns nil if encoding fails. Called synchronously so that CVPixelBuffers
-    /// are never captured by an async closure — this eliminates the ARFrame
-    /// retention warnings.
+    /// Returns nil if encoding fails. Called on encodeQueue with a retained ARFrame
+    /// (not a raw CVPixelBuffer) to avoid exhausting ARKit's internal buffer pool.
     private func buildPacket(
         rgb: CVPixelBuffer,
         depth: CVPixelBuffer?,
@@ -436,34 +449,28 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         let height = CVPixelBufferGetHeight(depthMap)
         guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
 
-        let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
+        let floatBuffer = baseAddress.assumingMemoryBound(to: Float.self)
         let count = width * height
 
-        // Convert Float32 -> Float16 to halve bandwidth
-        var float16Data = Data(count: count * 2)
-        float16Data.withUnsafeMutableBytes { rawBuffer in
-            let f16Buffer = rawBuffer.bindMemory(to: UInt16.self)
-            for i in 0..<count {
-                f16Buffer[i] = floatToFloat16(floatBuffer[i])
-            }
+        // Convert Float32 -> Float16 via Accelerate (SIMD-vectorized, ~10x faster than scalar loop)
+        var float16Data = Data(count: count * MemoryLayout<UInt16>.size)
+        float16Data.withUnsafeMutableBytes { rawDst in
+            var src = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: floatBuffer),
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: width * MemoryLayout<Float>.size
+            )
+            var dst = vImage_Buffer(
+                data: rawDst.baseAddress!,
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: width * MemoryLayout<UInt16>.size
+            )
+            vImageConvert_PlanarFtoPlanar16F(&src, &dst, 0)
         }
 
         return float16Data
-    }
-
-    /// IEEE 754 Float32 -> Float16 conversion
-    private func floatToFloat16(_ value: Float) -> UInt16 {
-        let bits = value.bitPattern
-        let sign = (bits >> 16) & 0x8000
-        let exponent = Int((bits >> 23) & 0xFF) - 127 + 15
-        let mantissa = bits & 0x007FFFFF
-
-        if exponent <= 0 {
-            return UInt16(sign)  // Flush to zero for very small values
-        } else if exponent >= 31 {
-            return UInt16(sign | 0x7C00)  // Infinity
-        }
-        return UInt16(sign | UInt32(exponent << 10) | (mantissa >> 13))
     }
 
     private func updateDepthStats(_ depthMap: CVPixelBuffer) {

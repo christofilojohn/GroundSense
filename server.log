@@ -1,0 +1,46 @@
+Disabling PyTorch because PyTorch >= 2.4 is required but found 2.2.2
+PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+2026-04-01 16:08:21,204 [INFO] Loading YOLO model: yolo26s-seg.pt on cpu
+2026-04-01 16:08:21,283 [INFO] Model loaded successfully
+2026-04-01 16:08:21,283 [INFO] Starting GroundSense server on ws://0.0.0.0:8765
+2026-04-01 16:08:21,283 [INFO] Model: yolo26s-seg.pt | Device: cpu
+2026-04-01 16:08:21,298 [INFO] server listening on 0.0.0.0:8765
+2026-04-01 16:08:21,318 [INFO] ══════════════════════════════════════════════════════════════
+2026-04-01 16:08:21,318 [INFO]   GroundSense — connection options
+2026-04-01 16:08:21,318 [INFO] ══════════════════════════════════════════════════════════════
+2026-04-01 16:08:21,318 [INFO]   📶  ws://10.6.37.214:8765   [en0]  ← Wi-Fi
+2026-04-01 16:08:21,318 [INFO] 
+2026-04-01 16:08:21,318 [INFO]   ── Option A: Mac hotspot  (no Wi-Fi, no data, no cable) ──
+2026-04-01 16:08:21,318 [INFO]      Mac → System Settings → General → Sharing
+2026-04-01 16:08:21,318 [INFO]      → Internet Sharing → share via Wi-Fi → turn ON
+2026-04-01 16:08:21,318 [INFO]      iPhone joins the Mac's Wi-Fi network
+2026-04-01 16:08:21,318 [INFO]      Server address: ws://192.168.2.1:8765
+2026-04-01 16:08:21,318 [INFO] 
+2026-04-01 16:08:21,318 [INFO]   ── Option B: USB cable  (fastest, zero data) ──
+2026-04-01 16:08:21,318 [INFO]      iPhone → Settings → Personal Hotspot → ON
+2026-04-01 16:08:21,318 [INFO]      Connect cable — use the ⚡ address above
+2026-04-01 16:08:21,318 [INFO]      Note: the WebSocket is local; no cellular data is used
+2026-04-01 16:08:21,318 [INFO] ══════════════════════════════════════════════════════════════
+
+  ┌─ Scan to connect ─────────────────────────────────┐
+  │  ws://10.6.37.214:8765
+  └───────────────────────────────────────────────────┘
+  █████████████████████████████
+  ██ ▄▄▄▄▄ █▄█ ▀█▀▀▄██ ▄▄▄▄▄ ██
+  ██ █   █ █▀ ▄▀▄▀██▄█ █   █ ██
+  ██ █▄▄▄█ █ ▄▄█▀▄█▄██ █▄▄▄█ ██
+  ██▄▄▄▄▄▄▄█ █ ▀ █ ▀▄█▄▄▄▄▄▄▄██
+  ██▄█▀▀ ▀▄ ▄██▀▄▀▄▀▄▄▄  ▄▀▀▄██
+  █████▀▄▀▄▀▄▄ ▄▀▄▄ ▀▀ ▀▄ ▀▄▀██
+  ██  ██▀▄▄█ ▄▀▄▄▀▄▀▄▀▄▀▀▀ ▀▄██
+  ████ ▄▀ ▄  ▄ █▀█ ▄ ▄▀▀ ▀▀█▀██
+  ██▄▄▄▄█▄▄█▀ ▀▄▀▄ ▀ ▄▄▄ ▀  ▄██
+  ██ ▄▄▄▄▄ █▄█  ▄ ▄▀ █▄█ ▀▀████
+  ██ █   █ █▄█ █▄ ▀█ ▄  ▄▄▄  ██
+  ██ █▄▄▄█ ███▄█▀█▀▀██▄██▀  ███
+  ██▄▄▄▄▄▄▄█▄██▄█▄▄██▄█▄▄▄▄▄▄██
+  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+2026-04-01 16:08:21,335 [INFO] Server ready — waiting for iPhone connection...
+2026-04-01 16:08:32,607 [INFO] connection open
+2026-04-01 16:08:32,608 [INFO] Client connected: ('127.0.0.1', 64218)

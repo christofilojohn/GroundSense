@@ -448,10 +448,8 @@ class Visualizer:
         Draws the latest frame and pumps the OpenCV event loop.
         Returns False when the user presses 'q'.
 
-        The iPhone ARKit sensor delivers frames in *landscape* pixel format even
-        when the phone is held in portrait.  We rotate 90° CW here so the preview
-        matches how the user holds the device.  Bounding-box normalised coords are
-        transformed accordingly: landscape (nx,ny) → rotated (1-ny, nx).
+        Rotates the frame only if it's not marked as 'landscape' (default for iPhone
+        which delivers landscape pixels that need a 90° CW turn for portrait display).
         """
         with self._lock:
             data = self._pending
@@ -475,8 +473,13 @@ class Visualizer:
                 self._frame_idx = 0
                 self._fps_time = now
 
-            # ── Rotate 90° CW to match portrait phone orientation ────
-            rgb = cv2.rotate(frame.rgb, cv2.ROTATE_90_CLOCKWISE)
+            # ── Handle rotation based on metadata ────────────────────
+            orientation = frame.metadata.get("orientation", "portrait")
+            if orientation == "landscape":
+                rgb = frame.rgb
+            else:
+                # Default iPhone behaviour: rotate 90° CW to match screen
+                rgb = cv2.rotate(frame.rgb, cv2.ROTATE_90_CLOCKWISE)
 
             # Scale to a fixed display height so the window stays manageable
             h_orig, w_orig = rgb.shape[:2]
@@ -491,7 +494,10 @@ class Visualizer:
             # New bbox corners: (1-ny2, nx1, 1-ny1, nx2).
             for obj in scene.objects:
                 nx1, ny1, nx2, ny2 = obj.bbox
-                rx1, ry1, rx2, ry2 = 1.0 - ny2, nx1, 1.0 - ny1, nx2
+                if orientation == "landscape":
+                    rx1, ry1, rx2, ry2 = nx1, ny1, nx2, ny2
+                else:
+                    rx1, ry1, rx2, ry2 = 1.0 - ny2, nx1, 1.0 - ny1, nx2
                 x1, y1 = int(rx1 * w), int(ry1 * h)
                 x2, y2 = int(rx2 * w), int(ry2 * h)
                 if obj.distance_m < self._ALERT:
@@ -519,7 +525,8 @@ class Visualizer:
                 d = np.clip(frame.depth, 0.0, 10.0)
                 d_norm = (d / 10.0 * 255).astype(np.uint8)
                 depth_colour = cv2.applyColorMap(d_norm, cv2.COLORMAP_PLASMA)
-                depth_colour = cv2.rotate(depth_colour, cv2.ROTATE_90_CLOCKWISE)
+                if orientation != "landscape":
+                    depth_colour = cv2.rotate(depth_colour, cv2.ROTATE_90_CLOCKWISE)
                 depth_colour = cv2.resize(depth_colour, (dw, dh),
                                           interpolation=cv2.INTER_CUBIC)
                 cv2.putText(depth_colour, "depth  (0 m \u2192 10 m)", (8, 20),
@@ -542,7 +549,7 @@ class Visualizer:
 class GroundSenseServer:
     """WebSocket server that processes iPhone frames and returns guidance."""
 
-    def __init__(self, model_name: str = "yolo11n-seg.pt", device: str = "cpu",
+    def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu",
                  visualize: bool = False):
         self.pipeline = SegmentationPipeline(model_name=model_name, device=device)
         self.response_gen = ResponseGenerator()
