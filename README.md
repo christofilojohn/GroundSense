@@ -41,6 +41,9 @@ python server.py --llm none
 
 # Override device manually:
 python server.py --device cpu --gemini-key YOUR_KEY
+
+# If port 8765 is already in use:
+python server.py --port 8766
 ```
 
 ### 3. iPhone App
@@ -68,7 +71,7 @@ python fake_client.py --query "what is in front of me?"
 - **iPhone**: iPhone 12 Pro or later (LiDAR required)
 - **iOS**: 16.0+
 - **Backend**: Python 3.10+, Windows/macOS/Linux
-- **Model**: YOLO11n-seg (auto-downloaded on first run)
+- **Model**: YOLO26s-seg (auto-downloaded on first run)
 - **Query engine**: Gemini API key (free tier) — falls back to rule-based if absent
 
 ## Wire Protocol

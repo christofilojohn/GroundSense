@@ -24,6 +24,7 @@ import argparse
 import time
 import logging
 import threading
+import errno
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -50,6 +51,20 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("groundsense")
+
+
+class ServerStartupError(RuntimeError):
+    """Raised when the WebSocket server cannot start cleanly."""
+
+
+def _wrap_server_startup_error(host: str, port: int, exc: OSError) -> Exception:
+    """Convert low-level bind errors into actionable startup messages."""
+    if exc.errno == errno.EADDRINUSE:
+        return ServerStartupError(
+            f"Port {port} is already in use on {host}. "
+            f"Stop the existing listener or rerun with --port <free-port>."
+        )
+    return exc
 
 
 # ── Frame unpacking ──────────────────────────────────────────────────
@@ -869,16 +884,23 @@ def _print_connection_guide(port: int):
 # ── Entry point ───────────────────────────────────────────────────────
 
 async def _serve(host: str, port: int, server: "GroundSenseServer",
-                 stop_event: asyncio.Event):
-    async with websockets.serve(
-        server.handle_client,
-        host,
-        port,
-        max_size=10 * 1024 * 1024,
-    ):
-        _print_connection_guide(port)
-        logger.info("Server ready — waiting for iPhone connection...")
-        await stop_event.wait()
+                 stop_event: asyncio.Event, startup_ready=None):
+    try:
+        async with websockets.serve(
+            server.handle_client,
+            host,
+            port,
+            max_size=10 * 1024 * 1024,
+        ):
+            if startup_ready is not None:
+                startup_ready.set()
+            _print_connection_guide(port)
+            logger.info("Server ready — waiting for iPhone connection...")
+            await stop_event.wait()
+    except OSError as exc:
+        if startup_ready is not None:
+            startup_ready.set()
+        raise _wrap_server_startup_error(host, port, exc) from exc
 
 
 def main(host: str, port: int, model: str, device: str, visualize: bool,
@@ -903,19 +925,28 @@ def main(host: str, port: int, model: str, device: str, visualize: bool,
         # set_event_loop(), then hand it back via a mutable list + a
         # threading.Event that gates the main thread until it's ready.
         loop = asyncio.new_event_loop()
-        _ready      = threading.Event()   # set once asyncio.Event is created
+        _ready      = threading.Event()   # set once startup succeeds or fails
         _stop_holder: list = []           # [asyncio.Event] — filled by thread
+        _startup_error: list = []         # [Exception] — set if bind/startup fails
 
         def _run_loop():
             asyncio.set_event_loop(loop)
             stop_event = asyncio.Event()  # now bound to the correct loop
             _stop_holder.append(stop_event)
-            _ready.set()                  # unblock main thread
-            loop.run_until_complete(_serve(host, port, server, stop_event))
+            try:
+                loop.run_until_complete(
+                    _serve(host, port, server, stop_event, startup_ready=_ready)
+                )
+            except Exception as exc:
+                _startup_error.append(exc)
+                _ready.set()              # unblock main thread on startup failure
 
         t = threading.Thread(target=_run_loop, daemon=True)
         t.start()
-        _ready.wait()                     # wait until stop_event exists
+        _ready.wait()
+
+        if _startup_error:
+            raise SystemExit(str(_startup_error[0]))
 
         # Main thread: OpenCV render loop (~60 Hz)
         vis = server.visualizer
@@ -929,26 +960,32 @@ def main(host: str, port: int, model: str, device: str, visualize: bool,
             vis.close()
             t.join(timeout=3)
     else:
-        asyncio.run(_serve_forever(host, port, server))
+        try:
+            asyncio.run(_serve_forever(host, port, server))
+        except ServerStartupError as exc:
+            raise SystemExit(str(exc)) from exc
 
 
 async def _serve_forever(host: str, port: int, server: "GroundSenseServer"):
-    async with websockets.serve(
-        server.handle_client,
-        host,
-        port,
-        max_size=10 * 1024 * 1024,
-    ):
-        _print_connection_guide(port)
-        logger.info("Server ready — waiting for iPhone connection...")
-        await asyncio.Future()
+    try:
+        async with websockets.serve(
+            server.handle_client,
+            host,
+            port,
+            max_size=10 * 1024 * 1024,
+        ):
+            _print_connection_guide(port)
+            logger.info("Server ready — waiting for iPhone connection...")
+            await asyncio.Future()
+    except OSError as exc:
+        raise _wrap_server_startup_error(host, port, exc) from exc
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GroundSense Backend Server")
     parser.add_argument("--host",   default="0.0.0.0",       help="Bind address")
     parser.add_argument("--port",   type=int, default=8765,   help="WebSocket port")
-    parser.add_argument("--model",  default="yolo11n-seg.pt", help="YOLO model name")
+    parser.add_argument("--model",  default="yolo26s-seg.pt", help="YOLO model name")
     parser.add_argument("--device", default=None,
                         help="Inference device: cuda | mps | cpu (auto-detected if omitted)")
     parser.add_argument("--visualize", action="store_true",
