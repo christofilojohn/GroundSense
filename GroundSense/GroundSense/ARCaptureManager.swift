@@ -157,17 +157,27 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         statusMessage = "Connected to \(url.host ?? "server")"
         listenForMessages()
 
-        // Restore pipeline mode and targets on (re-)connect.
-        // Small delay lets the WebSocket handshake complete first.
-        if pipelineMode != "yolo" || !detectionTargets.isEmpty {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                guard let self else { return }
-                if self.pipelineMode != "yolo" {
-                    self.setPipelineMode(self.pipelineMode)
+        // On (re-)connect: if the user had a non-default mode or targets configured,
+        // send them once after the WebSocket handshake settles.
+        // Guard: only send if actually non-default, and send mode+targets as a single
+        // coordinated pair so the server never sees them out of order.
+        let savedMode    = pipelineMode
+        let savedTargets = detectionTargets
+        guard savedMode != "yolo" || !savedTargets.isEmpty else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.isStreaming else { return }
+            // Send mode first, then targets — setPipelineMode would re-send targets
+            // internally, so call the lower-level sender directly to avoid doubling up.
+            if savedMode != "yolo" {
+                if let data = try? JSONSerialization.data(withJSONObject: [
+                    "type": "set_pipeline", "mode": savedMode
+                ]), let text = String(data: data, encoding: .utf8) {
+                    self.sendTextMessage(text)
                 }
-                if !self.detectionTargets.isEmpty {
-                    self.setDetectionTargets(self.detectionTargets)
-                }
+            }
+            if !savedTargets.isEmpty {
+                self.setDetectionTargets(savedTargets)
             }
         }
     }
@@ -366,17 +376,22 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     /// - "gdino" — Grounding DINO only (open-vocabulary targets, no YOLO)
     /// - "both"  — YOLO always + GDINO for user targets (highest coverage)
     func setPipelineMode(_ mode: String) {
+        let previous = pipelineMode
         pipelineMode = mode
         guard isStreaming else { return }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: [
-            "type": "set_pipeline",
-            "mode": mode,
-        ]), let text = String(data: data, encoding: .utf8) else { return }
-        sendTextMessage(text)
+        // Only send set_pipeline when the mode actually changes.
+        if mode != previous {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "type": "set_pipeline",
+                "mode": mode,
+            ]), let text = String(data: data, encoding: .utf8) else { return }
+            sendTextMessage(text)
+        }
 
-        // Re-send targets whenever switching to a GDINO-capable mode.
-        if mode != "yolo" && !detectionTargets.isEmpty {
+        // Send targets when switching INTO a GDINO-capable mode for the first time,
+        // but not if the mode didn't change (avoids redundant cache resets on server).
+        if mode != "yolo" && !detectionTargets.isEmpty && mode != previous {
             setDetectionTargets(detectionTargets)
         }
     }

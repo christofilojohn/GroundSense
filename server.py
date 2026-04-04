@@ -370,8 +370,9 @@ class OpenVocabPipeline:
         self._processor    = None
         self._gdino_model  = None
         self._sam_pred     = None
-        self._loaded       = False
+        self._loaded          = False
         self._load_err: Optional[str] = None
+        self._load_err_logged = False   # print the missing-dep warning only once
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -413,6 +414,13 @@ class OpenVocabPipeline:
         if self._loaded:
             return True
         if self._load_err:
+            if not self._load_err_logged:
+                logger.warning(
+                    f"[OpenVocab] model unavailable ({self._load_err}). "
+                    "Install with:  pip install transformers torch\n"
+                    "  All open-vocab inference will be skipped until the server restarts."
+                )
+                self._load_err_logged = True
             return False
         try:
             import torch
@@ -494,17 +502,39 @@ class OpenVocabPipeline:
         with torch.no_grad():
             outputs = self._gdino_model(**inputs)
 
-        detections = self._processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=self.BOX_THRESHOLD,
-            text_threshold=self.TEXT_THRESHOLD,
-            target_sizes=[(h, w)],
-        )[0]
+        # transformers < ~4.44 used `box_threshold`; newer versions renamed it to
+        # `threshold`.  Try both so the server works across versions.
+        try:
+            raw = self._processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=self.BOX_THRESHOLD,
+                text_threshold=self.TEXT_THRESHOLD,
+                target_sizes=[(h, w)],
+            )
+        except TypeError:
+            raw = self._processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=self.BOX_THRESHOLD,
+                target_sizes=[(h, w)],
+            )
+        detections = raw[0]
 
         boxes  = detections["boxes"].cpu().numpy()   # (N, 4) xyxy pixel
         scores = detections["scores"].cpu().numpy()  # (N,)
-        labels = detections["labels"]                # list[str]
+
+        # `labels` can be a list of strings (newer transformers) or a list of
+        # ints / tensors (older) that need batch-decoding.
+        raw_labels = detections.get("labels", [])
+        if raw_labels and isinstance(raw_labels[0], str):
+            labels = raw_labels
+        else:
+            # Decode token IDs → text
+            labels = [
+                self._processor.decode(torch.tensor([tok]), skip_special_tokens=True).strip()
+                for tok in raw_labels
+            ]
 
         depth   = frame.depth
         objects: list[DetectedObject] = []
@@ -932,6 +962,9 @@ class GroundSenseServer:
         # Active detection mode: "yolo" | "gdino" | "both"
         # Changed at runtime via {"type": "set_pipeline", "mode": "..."}
         self._pipeline_mode: str = "yolo"
+        # Guard: prevents queuing multiple concurrent GDINO background tasks.
+        # True while a background inference task is in flight.
+        self._gdino_running: bool = False
         self.frame_count = 0
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
@@ -988,20 +1021,32 @@ class GroundSenseServer:
                 frame.depth, []
             )
 
-        # ── Secondary pipeline: Grounding DINO ───────────────────────
-        # Runs only when the mode is "gdino" or "both", targets are set,
-        # and the open-vocab pipeline is enabled.  Results are appended to
-        # whatever YOLO found (or an empty list in gdino-only mode).
+        # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
+        # GDINO inference takes ~500–2000 ms on CPU, far too slow to await
+        # on every frame.  Instead:
+        #   • Merge the *cached* result from the last completed inference
+        #     into this frame's scene immediately (always fast — a list copy).
+        #   • Every `interval` frames, if no inference is already running,
+        #     fire a background asyncio Task that calls the executor and
+        #     updates the cache when done.  The current frame never waits.
         if (self._open_vocab_enabled
                 and mode in ("gdino", "both")
                 and self.open_vocab.target_objects):
-            ov_objects = await loop.run_in_executor(
-                None, self.open_vocab.process_frame, frame
-            )
+
+            # 1. Use last known result now (stale by at most interval frames)
+            ov_objects = list(self.open_vocab._cached)
             if ov_objects:
                 scene.objects.extend(ov_objects)
                 scene.objects.sort(key=lambda o: o.distance_m)
                 scene.closest_obstacle_m = scene.objects[0].distance_m
+
+            # 2. Kick off fresh inference in the background if it's due
+            self.open_vocab._frame_count += 1
+            if (self.open_vocab._frame_count % self.open_vocab.interval == 0
+                    and not self._gdino_running
+                    and self.open_vocab._ensure_loaded()):
+                self._gdino_running = True
+                asyncio.create_task(self._run_gdino_background(frame))
 
         # Persist scene for query handler
         self.last_scene = scene
@@ -1144,6 +1189,47 @@ class GroundSenseServer:
             "ok": True,
             "mode": mode,
         }))
+
+    async def _run_gdino_background(self, frame: "Frame") -> None:
+        """
+        Fire-and-forget background task for Grounding DINO inference.
+
+        Runs `_run_gdino` in a thread-pool executor so the event loop stays
+        free.  When inference completes, the shared `open_vocab._cached` list
+        is updated atomically (GIL-protected single assignment in CPython).
+        The `_gdino_running` guard prevents queueing multiple overlapping
+        tasks — if inference takes longer than `interval` frames, we simply
+        skip the missed trigger rather than pile up.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            logger.info(
+                f"[OpenVocab] running GDINO inference "
+                f"(frame {self.open_vocab._frame_count}, "
+                f"targets={self.open_vocab.target_objects})"
+            )
+            result = await loop.run_in_executor(
+                None, self.open_vocab._run_gdino, frame
+            )
+            self.open_vocab._cached = result
+            if result:
+                logger.info(
+                    "[OpenVocab] detected: "
+                    + ", ".join(
+                        f"{o.class_name} {o.distance_m:.1f}m {o.direction}"
+                        for o in result
+                    )
+                )
+            else:
+                logger.info(
+                    f"[OpenVocab] no detections for {self.open_vocab.target_objects} "
+                    f"(box_thresh={self.open_vocab.BOX_THRESHOLD}) — "
+                    "try a longer description, e.g. 'dog' not 'canine'"
+                )
+        except Exception as exc:
+            logger.warning(f"[OpenVocab] background inference error: {exc}")
+        finally:
+            self._gdino_running = False
 
 
 # ── Network interface detection ───────────────────────────────────────
