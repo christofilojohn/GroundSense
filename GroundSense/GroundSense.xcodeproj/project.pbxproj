@@ -11,6 +11,9 @@
 		B8C9D0E8B3F2A1C0D4E5F613 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F605 /* ContentView.swift */; };
 		B8C9D0E8B3F2A1C0D4E5F614 /* ARCaptureManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F606 /* ARCaptureManager.swift */; };
 		B8C9D0E8B3F2A1C0D4E5F615 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F608 /* Assets.xcassets */; };
+		AA0000001111222233334402 /* RecordingManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334401 /* RecordingManager.swift */; };
+		AA0000001111222233334404 /* RecordingGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334403 /* RecordingGalleryView.swift */; };
+		AA0000001111222233334406 /* LogoIdleScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334405 /* LogoIdleScreen.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -19,6 +22,9 @@
 		B8C9D0E8B3F2A1C0D4E5F606 /* ARCaptureManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARCaptureManager.swift; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F607 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F608 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		AA0000001111222233334401 /* RecordingManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingManager.swift; sourceTree = "<group>"; };
+		AA0000001111222233334403 /* RecordingGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingGalleryView.swift; sourceTree = "<group>"; };
+		AA0000001111222233334405 /* LogoIdleScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogoIdleScreen.swift; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F616 /* GroundSense.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GroundSense.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -55,6 +61,9 @@
 				B8C9D0E8B3F2A1C0D4E5F604 /* GroundSenseApp.swift */,
 				B8C9D0E8B3F2A1C0D4E5F605 /* ContentView.swift */,
 				B8C9D0E8B3F2A1C0D4E5F606 /* ARCaptureManager.swift */,
+				AA0000001111222233334401 /* RecordingManager.swift */,
+				AA0000001111222233334403 /* RecordingGalleryView.swift */,
+				AA0000001111222233334405 /* LogoIdleScreen.swift */,
 				B8C9D0E8B3F2A1C0D4E5F607 /* Info.plist */,
 				B8C9D0E8B3F2A1C0D4E5F608 /* Assets.xcassets */,
 			);
@@ -133,6 +142,9 @@
 				B8C9D0E8B3F2A1C0D4E5F612 /* GroundSenseApp.swift in Sources */,
 				B8C9D0E8B3F2A1C0D4E5F613 /* ContentView.swift in Sources */,
 				B8C9D0E8B3F2A1C0D4E5F614 /* ARCaptureManager.swift in Sources */,
+				AA0000001111222233334402 /* RecordingManager.swift in Sources */,
+				AA0000001111222233334404 /* RecordingGalleryView.swift in Sources */,
+				AA0000001111222233334406 /* LogoIdleScreen.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
