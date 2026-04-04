@@ -46,10 +46,6 @@ struct LogoIdleScreen: View {
                     .opacity(subtitleOpacity)
 
                 Spacer()
-
-                // ── Start hint ───────────────────────────────────────
-                StartHint()
-                    .padding(.bottom, 48)
             }
         }
         // Entire overlay fades out once AR session is running
@@ -82,34 +78,6 @@ struct LogoIdleScreen: View {
     }
 }
 
-// MARK: - Start Hint
-
-private struct StartHint: View {
-    @State private var arrowOffset: CGFloat = 0
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "chevron.up")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(.white.opacity(0.3))
-                .offset(y: arrowOffset)
-                .animation(
-                    .easeInOut(duration: 1.1).repeatForever(autoreverses: true),
-                    value: arrowOffset
-                )
-
-            Text("Tap  Start  to begin")
-                .font(.system(.caption, design: .rounded))
-                .foregroundColor(.white.opacity(0.3))
-                .kerning(0.5)
-        }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
-                arrowOffset = -6
-            }
-        }
-    }
-}
 
 #Preview {
     LogoIdleScreen(isRunning: false)
