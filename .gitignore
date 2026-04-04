@@ -1,3 +1,4 @@
 yolo11n-seg.pt
 yolo26s-seg.pt
 /__pycache__
+FastSAM-s.pt

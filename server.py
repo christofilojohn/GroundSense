@@ -140,6 +140,7 @@ class DetectedObject:
     bbox: tuple                # (x1, y1, x2, y2) normalized
     mask_area_ratio: float     # fraction of frame covered
     source: str = "yolo"       # "yolo" | "gdino"
+    contour: Optional[list] = None  # [(nx, ny), ...] normalised portrait points
 
 @dataclass 
 class SceneState:
@@ -254,6 +255,23 @@ class SegmentationPipeline:
                     if len(depth_values) > 0:
                         distance = float(np.median(depth_values))
 
+                # ── Extract mask contour for visualizer overlay ──────
+                contour_pts = None
+                if masks is not None:
+                    raw_mask = masks[i].data[0].cpu().numpy()  # float32 [0,1]
+                    mh, mw = raw_mask.shape
+                    bin_mask = (raw_mask > 0.5).astype(np.uint8)
+                    cnts, _ = cv2.findContours(bin_mask, cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts:
+                        biggest = max(cnts, key=cv2.contourArea)
+                        eps = 0.02 * cv2.arcLength(biggest, True)
+                        approx = cv2.approxPolyDP(biggest, eps, True)
+                        # Normalise to [0,1] in landscape frame
+                        contour_pts = [(float(p[0][0]) / mw,
+                                        float(p[0][1]) / mh)
+                                       for p in approx]
+
                 obj = DetectedObject(
                     class_name=class_name,
                     track_id=track_id,
@@ -262,6 +280,7 @@ class SegmentationPipeline:
                     direction=direction,
                     bbox=(x1, y1, x2, y2),
                     mask_area_ratio=(x2 - x1) * (y2 - y1),
+                    contour=contour_pts,
                 )
                 scene.objects.append(obj)
 
@@ -349,9 +368,10 @@ class OpenVocabPipeline:
     """
 
     GDINO_MODEL     = "IDEA-Research/grounding-dino-tiny"
-    BOX_THRESHOLD   = 0.30
+    BOX_THRESHOLD   = 0.42   # raised — GDINO hallucinates below ~0.40
     TEXT_THRESHOLD  = 0.25
     SAM_WEIGHTS     = "mobile_sam.pt"
+    FASTSAM_MODEL   = "FastSAM-s.pt"  # auto-downloaded by ultralytics on first use
 
     def __init__(self, device: str = "cpu", interval: int = 5):
         """
@@ -367,9 +387,10 @@ class OpenVocabPipeline:
         self._frame_count = 0
 
         # Lazy-loaded — avoid paying the import cost unless the feature is used
-        self._processor    = None
-        self._gdino_model  = None
-        self._sam_pred     = None
+        self._processor     = None
+        self._gdino_model   = None
+        self._fastsam_model = None   # FastSAM (primary segmenter — ultralytics)
+        self._sam_pred      = None   # MobileSAM (fallback — needs mobile_sam.pt)
         self._loaded          = False
         self._load_err: Optional[str] = None
         self._load_err_logged = False   # print the missing-dep warning only once
@@ -461,12 +482,35 @@ class OpenVocabPipeline:
             return False
 
     def _try_load_sam(self) -> None:
-        import os
+        """
+        Load a segmentation model for precise per-object masks (used for better
+        depth estimation from LiDAR).  Priority order:
+
+        1. FastSAM-s  — ultralytics is already installed for YOLO; FastSAM-s.pt
+                        (~23 MB) auto-downloads on first use.  ~60 ms on CPU,
+                        ~8 ms on MPS/CUDA.
+        2. MobileSAM  — needs `pip install mobile-sam` + mobile_sam.pt weights.
+        3. Bbox-only  — falls back to the bounding-box region average (no mask).
+        """
+        # ── 1. FastSAM (preferred — ultralytics already present) ─────
+        try:
+            from ultralytics import FastSAM as _FastSAM
+            logger.info(
+                f"[OpenVocab] Loading FastSAM ({self.FASTSAM_MODEL}) "
+                "— downloads ~23 MB on first run …"
+            )
+            self._fastsam_model = _FastSAM(self.FASTSAM_MODEL)
+            logger.info("[OpenVocab] FastSAM ready — precise mask depth fusion active")
+            return
+        except Exception as exc:
+            logger.info(f"[OpenVocab] FastSAM unavailable ({exc}), trying MobileSAM …")
+
+        # ── 2. MobileSAM (fallback) ───────────────────────────────────
         if not os.path.exists(self.SAM_WEIGHTS):
             logger.info(
                 f"[OpenVocab] {self.SAM_WEIGHTS} not found — "
-                "using bbox-based depth estimation instead of MobileSAM masks. "
-                "Download from: https://github.com/ChaoningZhang/MobileSAM"
+                "falling back to bbox-based depth estimation. "
+                "For precise masks: pip install mobile-sam + download mobile_sam.pt"
             )
             return
         try:
@@ -551,26 +595,30 @@ class OpenVocabPipeline:
 
             direction = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
 
-            # ── Depth estimation ─────────────────────────────────────
+            # ── Depth estimation (mask → LiDAR sampling) ─────────────
             distance = float("inf")
             if depth is not None:
                 dh, dw = depth.shape
+                mask = None
 
-                if self._sam_pred is not None:
-                    # MobileSAM precise mask
+                # Priority: FastSAM > MobileSAM > bbox
+                if self._fastsam_model is not None:
+                    mask = self._fastsam_segment(rgb, boxes[i])
+                elif self._sam_pred is not None:
                     mask = self._sam_segment(rgb, boxes[i])
-                    if mask is not None:
-                        mask_r = cv2.resize(
-                            mask.astype(np.uint8), (dw, dh),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                        vals = depth[mask_r > 0]
-                        vals = vals[(vals > 0.1) & (vals < 10.0)]
-                        if len(vals) > 0:
-                            distance = float(np.median(vals))
+
+                if mask is not None:
+                    mask_r = cv2.resize(
+                        mask.astype(np.uint8), (dw, dh),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    vals = depth[mask_r > 0]
+                    vals = vals[(vals > 0.1) & (vals < 10.0)]
+                    if len(vals) > 0:
+                        distance = float(np.median(vals))
 
                 if distance == float("inf"):
-                    # Bbox-based fallback (or primary when SAM unavailable)
+                    # Bbox-based fallback — used when no segmenter is available
                     ix1 = max(0, int(nx1 * dw))
                     iy1 = max(0, int(ny1 * dh))
                     ix2 = min(dw, int(nx2 * dw))
@@ -581,6 +629,28 @@ class OpenVocabPipeline:
                         if len(vals) > 0:
                             distance = float(np.median(vals))
 
+            # ── Extract contour from SAM mask for visualizer ─────────
+            gdino_contour = None
+            if depth is not None:
+                # Re-obtain mask for contour (mask was computed above for depth)
+                seg_mask = None
+                if self._fastsam_model is not None:
+                    seg_mask = self._fastsam_segment(rgb, boxes[i])
+                elif self._sam_pred is not None:
+                    seg_mask = self._sam_segment(rgb, boxes[i])
+                if seg_mask is not None:
+                    bin_mask = seg_mask.astype(np.uint8)
+                    mh, mw = bin_mask.shape
+                    cnts, _ = cv2.findContours(bin_mask, cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts:
+                        biggest = max(cnts, key=cv2.contourArea)
+                        eps = 0.02 * cv2.arcLength(biggest, True)
+                        approx = cv2.approxPolyDP(biggest, eps, True)
+                        gdino_contour = [(float(p[0][0]) / mw,
+                                         float(p[0][1]) / mh)
+                                        for p in approx]
+
             objects.append(DetectedObject(
                 class_name    = str(labels[i]),
                 track_id      = -1,           # no tracker on open-vocab path
@@ -590,6 +660,7 @@ class OpenVocabPipeline:
                 bbox          = (nx1, ny1, nx2, ny2),
                 mask_area_ratio = (nx2 - nx1) * (ny2 - ny1),
                 source        = "gdino",
+                contour       = gdino_contour,
             ))
 
         objects.sort(key=lambda o: o.distance_m)
@@ -602,6 +673,70 @@ class OpenVocabPipeline:
                 )
             )
         return objects
+
+    def _fastsam_segment(
+        self, rgb: np.ndarray, box_xyxy: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Run FastSAM on the full frame, then return the mask whose bounding box
+        has the highest IoU with the GDINO-detected box.
+
+        FastSAM runs a YOLO-style "everything" segmentation pass in ~60 ms on
+        CPU (~8 ms on MPS).  We pick the best-overlapping mask rather than
+        using the box-prompt API, which is more robust across ultralytics versions.
+
+        Returns a boolean mask (H, W) in the original frame's pixel space,
+        or None if FastSAM finds no masks.
+        """
+        try:
+            h, w = rgb.shape[:2]
+            results = self._fastsam_model(
+                rgb,
+                device=self.device,
+                retina_masks=True,
+                imgsz=640,
+                conf=0.3,
+                iou=0.9,
+                verbose=False,
+            )
+            if not results or results[0].masks is None:
+                return None
+
+            masks = results[0].masks.data.cpu().numpy()  # (N, Hm, Wm)
+            x1p, y1p, x2p, y2p = box_xyxy
+
+            best_mask, best_iou = None, 0.0
+            for raw_mask in masks:
+                mh, mw = raw_mask.shape
+                # Scale GDINO pixel-bbox to mask resolution
+                bx1 = max(0, int(x1p * mw / w))
+                by1 = max(0, int(y1p * mh / h))
+                bx2 = min(mw, int(x2p * mw / w))
+                by2 = min(mh, int(y2p * mh / h))
+
+                bbox_region = np.zeros_like(raw_mask, dtype=bool)
+                bbox_region[by1:by2, bx1:bx2] = True
+                mask_bool   = raw_mask > 0.5
+
+                intersection = float((mask_bool & bbox_region).sum())
+                union        = float((mask_bool | bbox_region).sum())
+                iou = intersection / union if union > 0 else 0.0
+
+                if iou > best_iou:
+                    best_iou  = iou
+                    best_mask = mask_bool
+
+            if best_mask is not None and best_iou > 0.1:
+                # Resize best mask back to original frame resolution
+                return cv2.resize(
+                    best_mask.astype(np.uint8), (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            return None
+
+        except Exception as exc:
+            logger.warning(f"[OpenVocab] FastSAM error: {exc}")
+            return None
 
     def _sam_segment(
         self, rgb: np.ndarray, box_xyxy: np.ndarray
@@ -890,6 +1025,32 @@ class Visualizer:
             dw = int(w_orig * dh / h_orig)
             rgb = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_LINEAR)
             h, w = rgb.shape[:2]   # now equals (dh, dw)
+
+            # ── Segmentation mask overlays ───────────────────────────
+            # Draw filled semi-transparent polygons before the bbox lines so the
+            # boxes are always readable on top.
+            # Coordinate transform (portrait display after 90° CW rotation):
+            #   landscape (nx, ny) → portrait (px, py) = (1-ny, nx)
+            overlay = rgb.copy()
+            for obj in scene.objects:
+                if not obj.contour:
+                    continue
+                if orientation == "landscape":
+                    pts = [(int(nx * w), int(ny * h)) for nx, ny in obj.contour]
+                else:
+                    pts = [(int((1.0 - ny) * w), int(nx * h))
+                           for nx, ny in obj.contour]
+                poly = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+                if obj.source == "gdino":
+                    fill_colour = (180, 0, 180)   # purple for open-vocab
+                elif obj.distance_m < self._ALERT:
+                    fill_colour = (0, 0, 200)
+                elif obj.distance_m < self._WARN:
+                    fill_colour = (0, 120, 255)
+                else:
+                    fill_colour = (30, 160, 30)
+                cv2.fillPoly(overlay, [poly], fill_colour)
+            cv2.addWeighted(overlay, 0.35, rgb, 0.65, 0, rgb)
 
             # ── YOLO bounding boxes + labels ─────────────────────────
             # Original bbox is in landscape-normalised coords (nx1,ny1,nx2,ny2).

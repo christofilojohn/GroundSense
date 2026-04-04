@@ -24,6 +24,10 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lastSpokenText: String = ""
     @Published var transcribedQuery: String = ""
 
+    // MARK: - Scene objects (from server scene_update)
+    /// Last detected objects, used to draw bounding-box overlay on the camera feed.
+    @Published var sceneObjects: [SceneObject] = []
+
     // MARK: - Audio alerts mute
     /// When true the spoken obstacle warnings are suppressed; visual banner still shows.
     @Published var alertsMuted: Bool = false
@@ -213,6 +217,29 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
             let msgType = json["type"] as? String
 
+            // ── Scene objects → bounding box overlay ─────────────────
+            if msgType == "scene_update",
+               let scene = json["scene"] as? [String: Any],
+               let rawObjs = scene["objects"] as? [[String: Any]] {
+                let parsed: [SceneObject] = rawObjs.compactMap { obj in
+                    guard let bbox = obj["bbox"] as? [Double], bbox.count == 4
+                    else { return nil }
+                    return SceneObject(
+                        className:  obj["class"]       as? String ?? "?",
+                        distanceM:  obj["distance_m"]  as? Double ?? 0,
+                        direction:  obj["direction"]   as? String ?? "",
+                        confidence: obj["confidence"]  as? Double ?? 0,
+                        source:     obj["source"]      as? String ?? "yolo",
+                        // Stored in landscape-normalized coords (0–1).
+                        // The overlay view applies the 90° CW rotation to portrait.
+                        bboxX1: bbox[0], bboxY1: bbox[1],
+                        bboxX2: bbox[2], bboxY2: bbox[3]
+                    )
+                }
+                DispatchQueue.main.async { self.sceneObjects = parsed }
+            }
+
+            // ── Warnings & query responses ────────────────────────────
             if let warning = json["warning"] as? String {
                 // Visual banner always updates; speech is suppressed when muted.
                 DispatchQueue.main.async { self.lastSpokenText = warning }
@@ -611,6 +638,32 @@ private extension Data {
     mutating func appendUInt32LE(_ value: UInt32) {
         var v = value.littleEndian
         append(Data(bytes: &v, count: 4))
+    }
+}
+
+// MARK: - Scene Object (for bounding-box overlay)
+
+/// A single detected object received from the server's scene_update response.
+/// `bbox*` fields are in **landscape-normalised** coordinates (0–1), matching
+/// the frame the server processed.  The overlay view converts them to portrait.
+struct SceneObject: Identifiable {
+    let id = UUID()
+    let className: String
+    let distanceM: Double
+    let direction: String
+    let confidence: Double
+    let source: String          // "yolo" | "gdino"
+    let bboxX1: Double          // landscape left   (0–1)
+    let bboxY1: Double          // landscape top    (0–1)
+    let bboxX2: Double          // landscape right  (0–1)
+    let bboxY2: Double          // landscape bottom (0–1)
+
+    /// Box colour: GDINO detections are purple; YOLO uses distance-based traffic-light.
+    var overlayColor: UIColor {
+        if source == "gdino" { return UIColor(red: 0.7, green: 0.2, blue: 1.0, alpha: 1) }
+        if distanceM < 1.0   { return .systemRed }
+        if distanceM < 2.0   { return .systemOrange }
+        return .systemGreen
     }
 }
 
