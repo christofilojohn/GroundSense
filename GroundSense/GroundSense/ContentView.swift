@@ -6,6 +6,7 @@ struct ContentView: View {
     @StateObject private var captureManager = ARCaptureManager()
     @State private var serverAddress: String = ""
     @State private var showQRScanner: Bool = false
+    @State private var showGallery: Bool = false
 
     var body: some View {
         ZStack {
@@ -13,15 +14,18 @@ struct ContentView: View {
             ARViewContainer(session: captureManager.session)
                 .ignoresSafeArea()
 
+            // Logo idle screen — fades out when AR session starts
+            LogoIdleScreen(isRunning: captureManager.isRunning)
+
             // Overlay UI
             VStack(spacing: 0) {
 
-                // ── Top bar: status + FPS ────────────────────────────
+                // ── Top bar: status + FPS + recording indicator ──────
                 TopBar(captureManager: captureManager)
 
                 Spacer()
 
-                // ── Warning banner (shows last spoken obstacle warning) ──
+                // ── Warning banner (last spoken obstacle warning) ────
                 if !captureManager.lastSpokenText.isEmpty {
                     WarningBanner(text: captureManager.lastSpokenText)
                         .padding(.horizontal)
@@ -68,7 +72,8 @@ struct ContentView: View {
                 BottomControls(
                     captureManager: captureManager,
                     serverAddress: $serverAddress,
-                    showQRScanner: $showQRScanner
+                    showQRScanner: $showQRScanner,
+                    showGallery: $showGallery
                 )
             }
         }
@@ -78,6 +83,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showQRScanner) {
             QRScannerSheet(isPresented: $showQRScanner, scannedAddress: $serverAddress)
+        }
+        .sheet(isPresented: $showGallery) {
+            RecordingGalleryView(recordingManager: captureManager.recordingManager)
         }
     }
 }
@@ -89,6 +97,7 @@ private struct TopBar: View {
 
     var body: some View {
         HStack {
+            // Connection indicator
             Circle()
                 .fill(captureManager.isStreaming ? Color.green : Color.red)
                 .frame(width: 12, height: 12)
@@ -99,6 +108,14 @@ private struct TopBar: View {
                 .lineLimit(1)
 
             Spacer()
+
+            // Recording indicator — shown when a recording is active
+            if captureManager.recordingManager.isRecording {
+                RecordingIndicator(
+                    frameCount: captureManager.recordingManager.currentFrameCount,
+                    startDate: captureManager.recordingManager.recordingStartTime ?? Date()
+                )
+            }
 
             Text("\(Int(captureManager.fps)) FPS")
                 .font(.system(.caption, design: .monospaced))
@@ -116,6 +133,51 @@ private struct TopBar: View {
                 endPoint: .bottom
             )
         )
+    }
+}
+
+// MARK: - Recording Indicator (top bar badge)
+
+private struct RecordingIndicator: View {
+    let frameCount: Int
+    let startDate: Date
+
+    var body: some View {
+        HStack(spacing: 5) {
+            // Pulsing red dot
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+                .modifier(PulseAnimation())
+
+            ElapsedTimerView(startDate: startDate)
+
+            Text("• \(frameCount) fr")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.white.opacity(0.7))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.red.opacity(0.2))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.red.opacity(0.6), lineWidth: 1)
+        )
+    }
+}
+
+private struct PulseAnimation: ViewModifier {
+    @State private var scale: CGFloat = 1.0
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(scale)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    scale = 1.5
+                }
+            }
     }
 }
 
@@ -150,11 +212,12 @@ private struct BottomControls: View {
     @ObservedObject var captureManager: ARCaptureManager
     @Binding var serverAddress: String
     @Binding var showQRScanner: Bool
+    @Binding var showGallery: Bool
 
     var body: some View {
         VStack(spacing: 12) {
 
-            // STT transcript feedback (shows while listening)
+            // STT transcript feedback
             if captureManager.isListening {
                 HStack {
                     if #available(iOS 17.0, *) {
@@ -204,7 +267,7 @@ private struct BottomControls: View {
             .background(Color.white.opacity(0.15))
             .cornerRadius(12)
 
-            // Action buttons row
+            // ── Row 1: Start / Stop  |  Stream / Disconnect  |  Mic ──
             HStack(spacing: 12) {
 
                 // Start / Stop AR
@@ -244,7 +307,7 @@ private struct BottomControls: View {
                 }
                 .disabled(!captureManager.isRunning)
 
-                // Mic button — tap to start, tap again to stop
+                // Mic button
                 Button(action: {
                     if captureManager.isListening {
                         captureManager.stopListening()
@@ -252,9 +315,7 @@ private struct BottomControls: View {
                         captureManager.startListening()
                     }
                 }) {
-                    Image(systemName: captureManager.isListening
-                          ? "mic.fill"
-                          : "mic")
+                    Image(systemName: captureManager.isListening ? "mic.fill" : "mic")
                         .font(.title2)
                         .frame(width: 56, height: 56)
                         .background(captureManager.isListening ? Color.cyan : Color.white.opacity(0.2))
@@ -269,6 +330,29 @@ private struct BottomControls: View {
                 }
                 .disabled(!captureManager.isStreaming)
             }
+
+            // ── Row 2: Gallery  |  Record / Stop ────────────────────
+            HStack(spacing: 12) {
+
+                // Gallery button
+                Button(action: { showGallery = true }) {
+                    VStack(spacing: 4) {
+                        Image(systemName: "film.stack")
+                            .font(.title2)
+                        Text("\(captureManager.recordingManager.recordings.count)")
+                            .font(.caption2.weight(.bold))
+                    }
+                    .frame(width: 64, height: 56)
+                    .background(Color.white.opacity(0.15))
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+
+                // Record / Stop button (the big prominent one)
+                RecordButton(recordingManager: captureManager.recordingManager,
+                             fps: Double(captureManager.targetFPS))
+                    .disabled(!captureManager.isRunning)
+            }
         }
         .padding()
         .background(
@@ -281,6 +365,76 @@ private struct BottomControls: View {
     }
 }
 
+// MARK: - Record Button
+
+private struct RecordButton: View {
+    @ObservedObject var recordingManager: RecordingManager
+    let fps: Double
+
+    var isRecording: Bool { recordingManager.isRecording }
+    var isFull: Bool {
+        !isRecording && recordingManager.recordings.count >= RecordingManager.maxSlots
+    }
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 10) {
+                // Icon: filled circle when idle, filled square when recording
+                Image(systemName: isRecording ? "stop.circle.fill" : "record.circle")
+                    .font(.title2)
+                    .foregroundColor(isRecording ? .white : .red)
+
+                if isRecording, let start = recordingManager.recordingStartTime {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ElapsedTimerView(startDate: start)
+                        Text("\(recordingManager.currentFrameCount) frames")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                } else if isFull {
+                    Text("Gallery Full")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                } else {
+                    Text("Record")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
+
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: 56)
+            .background(recordingBackground)
+            .cornerRadius(12)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isRecording ? Color.red.opacity(0.8) : Color.clear, lineWidth: 2)
+            )
+        }
+        .disabled(isFull)
+    }
+
+    @ViewBuilder
+    private var recordingBackground: some View {
+        if isRecording {
+            Color.red.opacity(0.85)
+        } else if isFull {
+            Color.gray.opacity(0.4)
+        } else {
+            Color.red.opacity(0.25)
+        }
+    }
+
+    private func toggle() {
+        if isRecording {
+            recordingManager.stopRecording()
+        } else {
+            recordingManager.startRecording(fps: fps)
+        }
+    }
+}
+
 // MARK: - AR View Container (UIKit bridge)
 
 struct ARViewContainer: UIViewRepresentable {
@@ -290,7 +444,6 @@ struct ARViewContainer: UIViewRepresentable {
         let arView = ARSCNView()
         arView.session = session
         arView.automaticallyUpdatesLighting = true
-        // Show camera feed only, no debug overlays
         arView.debugOptions = []
         return arView
     }
@@ -300,7 +453,6 @@ struct ARViewContainer: UIViewRepresentable {
 
 // MARK: - QR Scanner Sheet
 
-/// A modal sheet that wraps the camera-based QR scanner.
 struct QRScannerSheet: View {
     @Binding var isPresented: Bool
     @Binding var scannedAddress: String
@@ -309,7 +461,6 @@ struct QRScannerSheet: View {
         NavigationView {
             ZStack {
                 QRScannerView { scanned in
-                    // Only accept ws:// URLs
                     if scanned.hasPrefix("ws://") || scanned.hasPrefix("wss://") {
                         scannedAddress = scanned
                         isPresented = false
@@ -317,7 +468,6 @@ struct QRScannerSheet: View {
                 }
                 .ignoresSafeArea()
 
-                // Viewfinder guide overlay
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.white.opacity(0.8), lineWidth: 2)
                     .frame(width: 220, height: 220)
@@ -349,7 +499,6 @@ struct QRScannerSheet: View {
 
 // MARK: - QR Scanner View (AVFoundation bridge)
 
-/// UIViewControllerRepresentable that uses AVCaptureMetadataOutput to scan QR codes.
 struct QRScannerView: UIViewControllerRepresentable {
     let onScan: (String) -> Void
 
@@ -369,7 +518,7 @@ final class QRScannerViewController: UIViewController,
 
     private var captureSession: AVCaptureSession?
     private var previewLayer: AVCaptureVideoPreviewLayer?
-    private var didScan = false   // fire onScan only once per presentation
+    private var didScan = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -423,7 +572,6 @@ final class QRScannerViewController: UIViewController,
         DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
     }
 
-    // AVCaptureMetadataOutputObjectsDelegate
     func metadataOutput(_ output: AVCaptureMetadataOutput,
                         didOutput metadataObjects: [AVMetadataObject],
                         from connection: AVCaptureConnection) {

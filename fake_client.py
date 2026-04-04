@@ -1,23 +1,42 @@
 """
-fake_client.py — Stream NYU Depth v2 frames to the GroundSense server,
-mimicking the iPhone app wire protocol.
+fake_client.py — Stream frames to the GroundSense server for offline testing.
+
+Supports two sources:
+  1. NYU Depth v2 .mat dataset  (default)
+  2. .gsrecording files captured on iPhone with the GroundSense app
 
 Usage:
     pip install h5py numpy opencv-python websockets
 
-    # Stream 30 frames starting at index 0
+    # Stream 30 NYU frames starting at index 0
     python fake_client.py
 
     # Stream frames 100-200 at 10 fps, then ask a query
     python fake_client.py --start 100 --count 100 --fps 10 --query "what is to my left?"
 
-    # Save a preview PNG to verify the data looks right 
+    # Save a preview PNG to verify NYU data looks right
     python fake_client.py --preview --count 0
+
+    # Replay a real iPhone recording captured with GroundSense
+    python fake_client.py --recording my_walk.gsrecording
+
+    # Replay at a different speed (default: use the recorded fps)
+    python fake_client.py --recording my_walk.gsrecording --replay-fps 5
 
 Wire format (must match Frame.from_bytes in server.py):
     [4B jpeg_size uint32LE][jpeg_bytes]
     [4B depth_size uint32LE][depth_float16_bytes]
     [4B meta_size uint32LE][meta_json_utf8]
+
+.gsrecording format (written by iOS RecordingManager.swift):
+    Fixed 32-byte header:
+      [0:8]   magic    b"GSREC\\x01\\x00\\n"
+      [8:12]  version  UInt32 LE = 1
+      [12:16] fps_mHz  UInt32 LE  (fps * 1000)
+      [16:20] frameCount UInt32 LE
+      [20:28] createdAt Float64 LE (Unix timestamp)
+      [28:32] flags    UInt32 LE = 0
+    Followed by frameCount wire-format frame packets (same layout as above).
 """
 
 import asyncio
@@ -312,9 +331,151 @@ async def interactive_query(ws, initial_query: str = "", display: bool = False,
             await ask(q)
 
 
+# ── .gsrecording playback ────────────────────────────────────────────
+
+# Magic bytes written by iOS RecordingManager.swift
+_GSREC_MAGIC   = b"GSREC\x01\x00\n"
+_GSREC_HEADER  = 32   # fixed header size in bytes
+
+
+def read_gsrecording(path: str):
+    """
+    Parse a .gsrecording file and return (fps, list_of_raw_packets).
+
+    Each element of list_of_raw_packets is a bytes object containing one
+    complete wire-format frame — it can be sent directly to the server via
+    ws.send() without any re-encoding.
+
+    Header layout (all little-endian):
+      [0:8]   magic     b"GSREC\\x01\\x00\\n"
+      [8:12]  version   uint32
+      [12:16] fps_mHz   uint32  (fps * 1000)
+      [16:20] frameCount uint32
+      [20:28] createdAt float64 (Unix timestamp)
+      [28:32] flags     uint32  (reserved)
+    """
+    with open(path, "rb") as f:
+        header = f.read(_GSREC_HEADER)
+        if len(header) < _GSREC_HEADER:
+            raise ValueError(f"{path}: file too short to contain a valid header")
+
+        magic = header[0:8]
+        if magic != _GSREC_MAGIC:
+            raise ValueError(
+                f"{path}: bad magic bytes {magic!r}. "
+                "Is this a GroundSense .gsrecording file?"
+            )
+
+        fps_mhz     = struct.unpack_from("<I", header, 12)[0]
+        frame_count = struct.unpack_from("<I", header, 16)[0]
+        created_at  = struct.unpack_from("<d", header, 20)[0]
+        fps         = fps_mhz / 1000.0
+
+        import datetime
+        ts_str = datetime.datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
+        log.info(f"Recording: {frame_count} frames @ {fps:.1f} fps  created {ts_str}")
+
+        packets: list[bytes] = []
+        for i in range(frame_count):
+            # Each frame is three TLV blocks: jpeg | depth_f16 | meta_json
+            pieces: list[bytes] = []
+            ok = True
+            for _ in range(3):
+                sz_bytes = f.read(4)
+                if len(sz_bytes) < 4:
+                    log.warning(f"  Truncated at frame {i}, block {_}")
+                    ok = False
+                    break
+                sz   = struct.unpack("<I", sz_bytes)[0]
+                data = f.read(sz)
+                if len(data) < sz:
+                    log.warning(f"  Short read at frame {i}: expected {sz}, got {len(data)}")
+                    ok = False
+                    break
+                pieces.append(sz_bytes + data)
+            if ok and len(pieces) == 3:
+                packets.append(b"".join(pieces))
+
+        log.info(f"Loaded {len(packets)} / {frame_count} complete frames from {path}")
+        return fps, packets
+
+
+async def stream_gsrecording(
+    server: str,
+    recording_path: str,
+    fps_override: float | None = None,
+    query: str = "",
+):
+    """Replay a .gsrecording file to the GroundSense server."""
+    fps, packets = read_gsrecording(recording_path)
+    if fps_override:
+        fps = fps_override
+        log.info(f"FPS overridden to {fps:.1f}")
+    interval = 1.0 / fps
+
+    log.info(f"Connecting to {server} …")
+    async with websockets.connect(server, max_size=10 * 1024 * 1024) as ws:
+        log.info(f"Connected. Replaying {len(packets)} frames at {fps:.1f} fps")
+
+        last_scene = None
+
+        for i, packet in enumerate(packets):
+            t0 = time.time()
+            await ws.send(packet)
+
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=8.0)
+                resp = json.loads(raw)
+
+                if resp.get("type") == "scene_update":
+                    scene = resp["scene"]
+                    last_scene = scene
+                    objs  = scene["objects"]
+                    free  = scene["free_direction"]
+                    close = scene["closest_obstacle_m"]
+                    obj_str = "  ".join(
+                        f"{o['class']} {o['distance_m']}m {o['direction']}"
+                        for o in objs[:4]
+                    ) or "(none)"
+                    log.info(
+                        f"  [{i:4d}/{len(packets)}] {len(objs)} obj | "
+                        f"free={free} | closest={close:.1f}m | {obj_str}"
+                    )
+                    if "warning" in resp:
+                        log.warning(f"  ⚠  {resp['warning']}")
+                else:
+                    log.info(f"  [{i:4d}] server: {raw[:120]}")
+
+            except asyncio.TimeoutError:
+                log.warning(f"  [{i:4d}] no response within 8 s")
+
+            # Throttle to recorded (or overridden) FPS
+            wait = interval - (time.time() - t0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        log.info("Playback finished.")
+
+        # Optional post-playback query
+        if query or sys.stdin.isatty():
+            await interactive_query(ws, query)
+
+
 # ── Entry point ───────────────────────────────────────────────────────
 
 async def main_async(args):
+
+    # ── Recording playback mode ──────────────────────────────────────
+    if args.recording:
+        await stream_gsrecording(
+            server=args.server,
+            recording_path=args.recording,
+            fps_override=args.replay_fps if args.replay_fps > 0 else None,
+            query=args.query,
+        )
+        return
+
+    # ── NYU dataset streaming mode ───────────────────────────────────
     dataset = NyuDataset(args.mat)
 
     try:
@@ -325,7 +486,6 @@ async def main_async(args):
             log.info("--count 0: skipping stream (preview only).")
             return
 
-        # Stream frames, get back the open WebSocket
         end = min(args.start + args.count, len(dataset))
         interval = 1.0 / args.fps
 
@@ -412,53 +572,86 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stream NYU Depth v2 frames to the GroundSense server"
+        description=(
+            "Stream frames to the GroundSense server.\n"
+            "Use --recording to replay a .gsrecording captured on iPhone,\n"
+            "or omit it to stream from the NYU Depth v2 dataset."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+
+    # ── Recording playback ──────────────────────────────────────────
+    rec_group = parser.add_argument_group("Recording playback (iPhone captures)")
+    rec_group.add_argument(
+        "--recording",
+        default="",
+        metavar="FILE.gsrecording",
+        help=(
+            "Path to a .gsrecording file captured with the GroundSense iOS app. "
+            "Replays it to the server instead of the NYU dataset. "
+            "No dataset dependency required."
+        ),
+    )
+    rec_group.add_argument(
+        "--replay-fps",
+        type=float,
+        default=0.0,
+        metavar="FPS",
+        help=(
+            "Override playback speed for --recording mode. "
+            "0 = use the fps stored in the recording (default)."
+        ),
+    )
+
+    # ── NYU dataset streaming ───────────────────────────────────────
+    nyu_group = parser.add_argument_group("NYU dataset streaming (default mode)")
+    nyu_group.add_argument(
         "--mat",
         default="nyu_small.mat",
         help="Path to dataset .mat file (default: nyu_small.mat)",
     )
+    nyu_group.add_argument(
+        "--fps",
+        type=float,
+        default=5.0,
+        help="Playback speed in frames per second (default: 5)",
+    )
+    nyu_group.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Index of first frame to send (default: 0)",
+    )
+    nyu_group.add_argument(
+        "--count",
+        type=int,
+        default=60,
+        help="Number of frames to send; 0 = preview only (default: 60)",
+    )
+    nyu_group.add_argument(
+        "--preview",
+        action="store_true",
+        help="Save preview_rgb.png + preview_depth.png before streaming",
+    )
+    nyu_group.add_argument(
+        "--display",
+        action="store_true",
+        help="Open a live window showing RGB + detections (press q to quit)",
+    )
+
+    # ── Shared ──────────────────────────────────────────────────────
     parser.add_argument(
         "--server",
         default="ws://localhost:8765",
         help="WebSocket server URL (default: ws://localhost:8765)",
     )
     parser.add_argument(
-        "--fps",
-        type=float,
-        default=5.0,
-        help="Playback speed in frames per second (default: 5)",
-    )
-    parser.add_argument(
-        "--start",
-        type=int,
-        default=0,
-        help="Index of first frame to send (default: 0)",
-    )
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=60,
-        help="Number of frames to send; 0 = preview only (default: 60)",
-    )
-    parser.add_argument(
         "--query",
         default="",
-        help="Voice query to send after streaming (e.g. 'what is ahead of me?')",
+        help="Voice query to send after streaming finishes",
     )
-    parser.add_argument(
-        "--preview",
-        action="store_true",
-        help="Save preview_rgb.png + preview_depth.png before streaming",
-    )
-    parser.add_argument(
-        "--display",
-        action="store_true",
-        help="Open a live window showing RGB + depth + server detections (press q to quit)",
-    )
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     asyncio.run(main_async(args))
 
 
