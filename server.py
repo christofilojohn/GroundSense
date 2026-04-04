@@ -139,6 +139,7 @@ class DetectedObject:
     direction: str             # "left", "center", "right"
     bbox: tuple                # (x1, y1, x2, y2) normalized
     mask_area_ratio: float     # fraction of frame covered
+    source: str = "yolo"       # "yolo" | "gdino"
 
 @dataclass 
 class SceneState:
@@ -157,6 +158,8 @@ class SceneState:
                     "distance_m": round(o.distance_m, 2),
                     "direction": o.direction,
                     "confidence": round(o.confidence, 2),
+                    "source": o.source,
+                    "bbox": list(o.bbox),
                 }
                 for o in self.objects
             ],
@@ -317,6 +320,273 @@ class SegmentationPipeline:
             if obj.distance_m < sector_min_dist[obj.direction]:
                 sector_min_dist[obj.direction] = obj.distance_m
         return max(sector_min_dist, key=sector_min_dist.get)
+
+
+# ── Open-Vocabulary Pipeline (Grounding DINO + MobileSAM) ────────────
+
+class OpenVocabPipeline:
+    """
+    Open-vocabulary object detection via Grounding DINO + MobileSAM.
+
+    Grounding DINO detects any object described in plain text (e.g.
+    "wheelchair", "service dog", "wet floor sign") — not limited to COCO
+    classes.  MobileSAM refines each detection to a precise segmentation
+    mask so depth fusion is as accurate as the YOLO path.
+
+    This pipeline is **throttled**: it runs every `interval` frames and
+    caches its result, so it blends into the 20-fps YOLO stream without
+    stalling the event loop.
+
+    Installation (one-time):
+        pip install transformers torch          # Grounding DINO (auto-downloads ~300 MB)
+        pip install mobile-sam                  # Optional — precise masks
+        # MobileSAM weights (place next to server.py):
+        #   wget https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+
+    Activation:
+        Send the WebSocket text message {"type": "set_targets", "objects": ["wheelchair"]}
+        The pipeline is dormant (zero overhead) when target_objects is empty.
+    """
+
+    GDINO_MODEL     = "IDEA-Research/grounding-dino-tiny"
+    BOX_THRESHOLD   = 0.30
+    TEXT_THRESHOLD  = 0.25
+    SAM_WEIGHTS     = "mobile_sam.pt"
+
+    def __init__(self, device: str = "cpu", interval: int = 5):
+        """
+        device   : "cpu" | "cuda" | "mps"
+        interval : run Grounding DINO every N frames (default 5 ≈ 4 fps
+                   at a 20-fps YOLO stream).  Cached results fill the gaps.
+        """
+        self.device   = device
+        self.interval = interval
+
+        self.target_objects: list[str] = []
+        self._cached: list[DetectedObject] = []
+        self._frame_count = 0
+
+        # Lazy-loaded — avoid paying the import cost unless the feature is used
+        self._processor    = None
+        self._gdino_model  = None
+        self._sam_pred     = None
+        self._loaded       = False
+        self._load_err: Optional[str] = None
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def set_targets(self, objects: list[str]) -> None:
+        """Update detection targets at runtime (thread-safe for simple list replace)."""
+        self.target_objects = [o.strip().lower() for o in objects if o.strip()]
+        self._cached = []          # invalidate cache so next frame re-detects
+        logger.info(f"[OpenVocab] targets → {self.target_objects}")
+
+    def process_frame(self, frame: "Frame") -> list[DetectedObject]:
+        """
+        Run Grounding DINO on this frame (throttled), return DetectedObjects.
+        Returns the cached result on off-frames.  Returns [] when no targets
+        are set so there is zero overhead in the default YOLO-only mode.
+        """
+        if not self.target_objects:
+            return []
+
+        self._frame_count += 1
+
+        # Off-frame: return stale cache rather than running inference
+        if self._frame_count % self.interval != 0:
+            return self._cached
+
+        if not self._ensure_loaded():
+            return []
+
+        try:
+            result = self._run_gdino(frame)
+            self._cached = result
+            return result
+        except Exception as exc:
+            logger.warning(f"[OpenVocab] inference error: {exc}")
+            return self._cached     # serve stale on error
+
+    # ── Model loading ─────────────────────────────────────────────────
+
+    def _ensure_loaded(self) -> bool:
+        if self._loaded:
+            return True
+        if self._load_err:
+            return False
+        try:
+            import torch
+            from transformers import (
+                AutoProcessor,
+                AutoModelForZeroShotObjectDetection,
+            )
+
+            logger.info(
+                "[OpenVocab] Loading Grounding DINO "
+                f"({self.GDINO_MODEL}) — first use, may take a moment …"
+            )
+            self._processor = AutoProcessor.from_pretrained(self.GDINO_MODEL)
+            self._gdino_model = (
+                AutoModelForZeroShotObjectDetection
+                .from_pretrained(self.GDINO_MODEL)
+                .to(self.device)
+                .eval()
+            )
+            logger.info("[OpenVocab] Grounding DINO ready")
+
+            # MobileSAM — optional, gracefully skipped if missing
+            self._try_load_sam()
+
+            self._loaded = True
+            return True
+
+        except ImportError as exc:
+            self._load_err = str(exc)
+            logger.warning(
+                f"[OpenVocab] Missing dependency: {exc}. "
+                "Install with: pip install transformers torch"
+            )
+            return False
+        except Exception as exc:
+            self._load_err = str(exc)
+            logger.error(f"[OpenVocab] Model load failed: {exc}")
+            return False
+
+    def _try_load_sam(self) -> None:
+        import os
+        if not os.path.exists(self.SAM_WEIGHTS):
+            logger.info(
+                f"[OpenVocab] {self.SAM_WEIGHTS} not found — "
+                "using bbox-based depth estimation instead of MobileSAM masks. "
+                "Download from: https://github.com/ChaoningZhang/MobileSAM"
+            )
+            return
+        try:
+            from mobile_sam import sam_model_registry, SamPredictor
+            sam = sam_model_registry["vit_t"](checkpoint=self.SAM_WEIGHTS)
+            sam.to(self.device)
+            self._sam_pred = SamPredictor(sam)
+            logger.info("[OpenVocab] MobileSAM ready — precise mask depth fusion active")
+        except ImportError:
+            logger.info(
+                "[OpenVocab] mobile-sam not installed — using bbox depth estimation. "
+                "Install with: pip install mobile-sam"
+            )
+
+    # ── Inference ─────────────────────────────────────────────────────
+
+    def _run_gdino(self, frame: "Frame") -> list[DetectedObject]:
+        import torch
+        from PIL import Image as PILImage
+
+        # BGR → RGB PIL for the processor
+        rgb     = cv2.cvtColor(frame.rgb, cv2.COLOR_BGR2RGB)
+        h, w    = rgb.shape[:2]
+        pil_img = PILImage.fromarray(rgb)
+
+        # Grounding DINO prompt format: "cat . dog . wheelchair ."
+        prompt = " . ".join(self.target_objects) + " ."
+
+        inputs = self._processor(
+            images=pil_img, text=prompt, return_tensors="pt"
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self._gdino_model(**inputs)
+
+        detections = self._processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            box_threshold=self.BOX_THRESHOLD,
+            text_threshold=self.TEXT_THRESHOLD,
+            target_sizes=[(h, w)],
+        )[0]
+
+        boxes  = detections["boxes"].cpu().numpy()   # (N, 4) xyxy pixel
+        scores = detections["scores"].cpu().numpy()  # (N,)
+        labels = detections["labels"]                # list[str]
+
+        depth   = frame.depth
+        objects: list[DetectedObject] = []
+
+        for i in range(len(boxes)):
+            x1p, y1p, x2p, y2p = boxes[i]
+
+            # Normalised coords
+            nx1 = float(x1p) / w
+            ny1 = float(y1p) / h
+            nx2 = float(x2p) / w
+            ny2 = float(y2p) / h
+            cx  = (nx1 + nx2) / 2
+
+            direction = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+
+            # ── Depth estimation ─────────────────────────────────────
+            distance = float("inf")
+            if depth is not None:
+                dh, dw = depth.shape
+
+                if self._sam_pred is not None:
+                    # MobileSAM precise mask
+                    mask = self._sam_segment(rgb, boxes[i])
+                    if mask is not None:
+                        mask_r = cv2.resize(
+                            mask.astype(np.uint8), (dw, dh),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        vals = depth[mask_r > 0]
+                        vals = vals[(vals > 0.1) & (vals < 10.0)]
+                        if len(vals) > 0:
+                            distance = float(np.median(vals))
+
+                if distance == float("inf"):
+                    # Bbox-based fallback (or primary when SAM unavailable)
+                    ix1 = max(0, int(nx1 * dw))
+                    iy1 = max(0, int(ny1 * dh))
+                    ix2 = min(dw, int(nx2 * dw))
+                    iy2 = min(dh, int(ny2 * dh))
+                    if ix2 > ix1 and iy2 > iy1:
+                        roi  = depth[iy1:iy2, ix1:ix2]
+                        vals = roi[(roi > 0.1) & (roi < 10.0)]
+                        if len(vals) > 0:
+                            distance = float(np.median(vals))
+
+            objects.append(DetectedObject(
+                class_name    = str(labels[i]),
+                track_id      = -1,           # no tracker on open-vocab path
+                confidence    = float(scores[i]),
+                distance_m    = distance,
+                direction     = direction,
+                bbox          = (nx1, ny1, nx2, ny2),
+                mask_area_ratio = (nx2 - nx1) * (ny2 - ny1),
+                source        = "gdino",
+            ))
+
+        objects.sort(key=lambda o: o.distance_m)
+        if objects:
+            logger.info(
+                "[OpenVocab] detected: "
+                + ", ".join(
+                    f"{o.class_name} {o.distance_m:.1f}m {o.direction}"
+                    for o in objects
+                )
+            )
+        return objects
+
+    def _sam_segment(
+        self, rgb: np.ndarray, box_xyxy: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Run MobileSAM with a bbox prompt → boolean mask (H, W)."""
+        try:
+            self._sam_pred.set_image(rgb)
+            masks, _, _ = self._sam_pred.predict(
+                box=box_xyxy[None],      # (1, 4)
+                multimask_output=False,
+            )
+            return masks[0]              # (H, W) bool
+        except Exception as exc:
+            logger.warning(f"[OpenVocab] MobileSAM error: {exc}")
+            return None
 
 
 # ── Obstacle Avoidance & Response Generation ─────────────────────────
@@ -653,9 +923,15 @@ class GroundSenseServer:
     """WebSocket server that processes iPhone frames and returns guidance."""
 
     def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu",
-                 visualize: bool = False, llm: str = "gemini", gemini_key: str = ""):
-        self.pipeline = SegmentationPipeline(model_name=model_name, device=device)
+                 visualize: bool = False, llm: str = "gemini", gemini_key: str = "",
+                 open_vocab: bool = True, gdino_interval: int = 5):
+        self.pipeline     = SegmentationPipeline(model_name=model_name, device=device)
+        self.open_vocab   = OpenVocabPipeline(device=device, interval=gdino_interval)
         self.response_gen = ResponseGenerator(llm=llm, gemini_key=gemini_key)
+        self._open_vocab_enabled = open_vocab
+        # Active detection mode: "yolo" | "gdino" | "both"
+        # Changed at runtime via {"type": "set_pipeline", "mode": "..."}
+        self._pipeline_mode: str = "yolo"
         self.frame_count = 0
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
@@ -672,8 +948,17 @@ class GroundSenseServer:
                 if isinstance(message, bytes):
                     await self._process_frame(websocket, message)
                 elif isinstance(message, str):
-                    # Text message = voice query
-                    await self._handle_query(websocket, message)
+                    # Peek at the JSON type to route correctly
+                    try:
+                        msg = json.loads(message)
+                        if msg.get("type") == "set_targets":
+                            await self._handle_set_targets(websocket, msg)
+                        elif msg.get("type") == "set_pipeline":
+                            await self._handle_set_pipeline(websocket, msg)
+                        else:
+                            await self._handle_query(websocket, message)
+                    except json.JSONDecodeError:
+                        await self._handle_query(websocket, message)
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client disconnected: {client_addr}")
 
@@ -687,10 +972,36 @@ class GroundSenseServer:
             logger.error(f"Frame decode error: {e}")
             return
 
-        # Run segmentation pipeline in a thread so YOLO's synchronous inference
-        # (~50-300 ms) doesn't block the asyncio event loop and stall WebSocket I/O.
         loop = asyncio.get_event_loop()
-        scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
+        mode = self._pipeline_mode   # snapshot — may change between awaits
+
+        # ── Primary pipeline: YOLO ────────────────────────────────────
+        # Runs synchronous inference in a thread so the event loop stays free.
+        # Skipped in "gdino" mode to reduce CPU/GPU load.
+        if mode in ("yolo", "both"):
+            scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
+        else:
+            # GDINO-only: build a blank scene and still estimate free direction
+            # from the raw LiDAR depth map (no bilateral filter, but accurate enough).
+            scene = SceneState(timestamp=frame.timestamp)
+            scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+                frame.depth, []
+            )
+
+        # ── Secondary pipeline: Grounding DINO ───────────────────────
+        # Runs only when the mode is "gdino" or "both", targets are set,
+        # and the open-vocab pipeline is enabled.  Results are appended to
+        # whatever YOLO found (or an empty list in gdino-only mode).
+        if (self._open_vocab_enabled
+                and mode in ("gdino", "both")
+                and self.open_vocab.target_objects):
+            ov_objects = await loop.run_in_executor(
+                None, self.open_vocab.process_frame, frame
+            )
+            if ov_objects:
+                scene.objects.extend(ov_objects)
+                scene.objects.sort(key=lambda o: o.distance_m)
+                scene.closest_obstacle_m = scene.objects[0].distance_m
 
         # Persist scene for query handler
         self.last_scene = scene
@@ -747,6 +1058,92 @@ class GroundSenseServer:
         }
         await websocket.send(json.dumps(response))
 
+    async def _handle_set_targets(self, websocket, msg: dict):
+        """
+        Handle {"type": "set_targets", "objects": ["wheelchair", "service dog"]}
+
+        Updates the open-vocabulary pipeline's target list at runtime.
+        Send an empty list to disable open-vocab detection and return to
+        YOLO-only mode with zero overhead.
+        """
+        objects = msg.get("objects", [])
+        if not isinstance(objects, list):
+            await websocket.send(json.dumps({
+                "type": "set_targets_ack",
+                "ok": False,
+                "error": "'objects' must be a JSON array of strings",
+            }))
+            return
+
+        if not self._open_vocab_enabled:
+            logger.warning(
+                "[OpenVocab] set_targets received but open-vocab pipeline is disabled "
+                "(start server without --no-open-vocab to enable)"
+            )
+            await websocket.send(json.dumps({
+                "type": "set_targets_ack",
+                "ok": False,
+                "error": "open-vocab pipeline is disabled on this server",
+                "targets": [],
+            }))
+            return
+
+        self.open_vocab.set_targets(objects)
+        logger.info(
+            f"[OpenVocab] targets updated → {self.open_vocab.target_objects} "
+            f"({'active' if objects else 'disabled — YOLO-only mode'})"
+        )
+        await websocket.send(json.dumps({
+            "type": "set_targets_ack",
+            "ok": True,
+            "targets": self.open_vocab.target_objects,
+        }))
+
+    async def _handle_set_pipeline(self, websocket, msg: dict):
+        """
+        Handle {"type": "set_pipeline", "mode": "yolo" | "gdino" | "both"}
+
+        Switches the active detection pipeline at runtime — no restart needed.
+
+        "yolo"  — YOLO-only (default). Fast COCO-class detection + LiDAR depth.
+        "gdino" — Grounding DINO only. Open-vocabulary user-specified targets,
+                  no YOLO overhead.  Requires targets to be set via set_targets.
+        "both"  — YOLO always-on plus GDINO for any set targets.
+                  Highest coverage; highest CPU load.
+        """
+        mode = msg.get("mode", "yolo").lower().strip()
+        valid = {"yolo", "gdino", "both"}
+
+        if mode not in valid:
+            await websocket.send(json.dumps({
+                "type": "set_pipeline_ack",
+                "ok": False,
+                "error": f"Invalid mode '{mode}'. Must be one of: {sorted(valid)}",
+            }))
+            return
+
+        if mode in ("gdino", "both") and not self._open_vocab_enabled:
+            await websocket.send(json.dumps({
+                "type": "set_pipeline_ack",
+                "ok": False,
+                "error": (
+                    f"Mode '{mode}' requires the open-vocab pipeline, but it is "
+                    "disabled on this server. Restart without --no-open-vocab."
+                ),
+            }))
+            return
+
+        prev = self._pipeline_mode
+        self._pipeline_mode = mode
+        logger.info(
+            f"[Pipeline] mode {prev} → {mode}"
+            + (f" | targets: {self.open_vocab.target_objects}" if mode != "yolo" else "")
+        )
+        await websocket.send(json.dumps({
+            "type": "set_pipeline_ack",
+            "ok": True,
+            "mode": mode,
+        }))
 
 
 # ── Network interface detection ───────────────────────────────────────
@@ -904,14 +1301,21 @@ async def _serve(host: str, port: int, server: "GroundSenseServer",
 
 
 def main(host: str, port: int, model: str, device: str, visualize: bool,
-         llm: str, gemini_key: str):
+         llm: str, gemini_key: str,
+         open_vocab: bool = True, gdino_interval: int = 5):
     server = GroundSenseServer(
         model_name=model, device=device, visualize=visualize,
         llm=llm, gemini_key=gemini_key,
+        open_vocab=open_vocab, gdino_interval=gdino_interval,
     )
     logger.info(f"Starting GroundSense server on ws://{host}:{port}")
-    logger.info(f"Model: {model} | Device: {device} | LLM: {llm}"
-                + (" | Visualizer: ON  (press q to quit)" if visualize else ""))
+    ov_status = (
+        f"enabled (interval={gdino_interval} frames)" if open_vocab else "disabled"
+    )
+    logger.info(
+        f"Model: {model} | Device: {device} | LLM: {llm} | OpenVocab: {ov_status}"
+        + (" | Visualizer: ON  (press q to quit)" if visualize else "")
+    )
 
     if visualize:
         # ── asyncio runs in a background thread; main thread owns OpenCV ──
@@ -994,6 +1398,24 @@ if __name__ == "__main__":
                         help="Query engine: gemini (default) | none (rule-based)")
     parser.add_argument("--gemini-key", default="",
                         help="Gemini API key (overrides GEMINI_API_KEY env var)")
+
+    # ── Open-vocabulary detection (Grounding DINO + MobileSAM) ──
+    ov_group = parser.add_mutually_exclusive_group()
+    ov_group.add_argument(
+        "--open-vocab", dest="open_vocab", action="store_true", default=True,
+        help="Enable open-vocabulary detection via Grounding DINO (default ON). "
+             "Activate at runtime with: {\"type\":\"set_targets\",\"objects\":[\"wheelchair\"]}",
+    )
+    ov_group.add_argument(
+        "--no-open-vocab", dest="open_vocab", action="store_false",
+        help="Disable the Grounding DINO pipeline entirely (YOLO-only mode).",
+    )
+    parser.add_argument(
+        "--gdino-interval", type=int, default=5, metavar="N",
+        help="Run Grounding DINO every N frames (default 5 ≈ 4 fps at 20-fps stream). "
+             "Lower = more responsive but higher CPU/GPU load.",
+    )
+
     args = parser.parse_args()
 
     if args.device is None:
@@ -1007,4 +1429,5 @@ if __name__ == "__main__":
         logger.info(f"Auto-selected device: {args.device}")
 
     main(args.host, args.port, args.model, args.device, args.visualize,
-         args.llm, args.gemini_key)
+         args.llm, args.gemini_key,
+         open_vocab=args.open_vocab, gdino_interval=args.gdino_interval)

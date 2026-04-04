@@ -400,11 +400,37 @@ def read_gsrecording(path: str):
         return fps, packets
 
 
+async def _send_set_targets(ws, targets_str: str) -> None:
+    """
+    Parse a comma-separated targets string and send a set_targets message.
+    Waits for the server's set_targets_ack.  No-op if targets_str is empty.
+    """
+    if not targets_str.strip():
+        return
+    objects = [t.strip() for t in targets_str.split(",") if t.strip()]
+    msg = json.dumps({"type": "set_targets", "objects": objects})
+    log.info(f"[OpenVocab] Sending set_targets: {objects}")
+    await ws.send(msg)
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        ack = json.loads(raw)
+        if ack.get("type") == "set_targets_ack":
+            if ack.get("ok"):
+                log.info(f"[OpenVocab] Targets confirmed by server: {ack.get('targets')}")
+            else:
+                log.warning(f"[OpenVocab] Server rejected targets: {ack.get('error')}")
+        else:
+            log.warning(f"[OpenVocab] Unexpected response to set_targets: {raw[:120]}")
+    except asyncio.TimeoutError:
+        log.warning("[OpenVocab] No ack received within 5 s — continuing anyway")
+
+
 async def stream_gsrecording(
     server: str,
     recording_path: str,
     fps_override: float | None = None,
     query: str = "",
+    targets: str = "",
 ):
     """Replay a .gsrecording file to the GroundSense server."""
     fps, packets = read_gsrecording(recording_path)
@@ -415,6 +441,8 @@ async def stream_gsrecording(
 
     log.info(f"Connecting to {server} …")
     async with websockets.connect(server, max_size=10 * 1024 * 1024) as ws:
+        # Activate open-vocab targets before the first frame
+        await _send_set_targets(ws, targets)
         log.info(f"Connected. Replaying {len(packets)} frames at {fps:.1f} fps")
 
         last_scene = None
@@ -472,6 +500,7 @@ async def main_async(args):
             recording_path=args.recording,
             fps_override=args.replay_fps if args.replay_fps > 0 else None,
             query=args.query,
+            targets=args.targets,
         )
         return
 
@@ -496,6 +525,8 @@ async def main_async(args):
         async with websockets.connect(
             args.server, max_size=10 * 1024 * 1024
         ) as ws:
+            # Activate open-vocab targets before the first frame
+            await _send_set_targets(ws, args.targets)
             log.info(
                 f"Connected. Streaming frames {args.start}–{end - 1} "
                 f"at {args.fps:.1f} fps"
@@ -649,6 +680,18 @@ def main():
         "--query",
         default="",
         help="Voice query to send after streaming finishes",
+    )
+    parser.add_argument(
+        "--targets",
+        default="",
+        metavar="OBJ1,OBJ2,...",
+        help=(
+            "Comma-separated open-vocabulary objects to detect via Grounding DINO "
+            "(e.g. --targets 'wheelchair,service dog,wet floor sign'). "
+            "Sent to the server before streaming starts. "
+            "Requires --open-vocab on the server (enabled by default). "
+            "Leave empty for YOLO-only mode."
+        ),
     )
 
     args = parser.parse_args()

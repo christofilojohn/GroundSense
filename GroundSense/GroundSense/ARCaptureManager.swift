@@ -24,6 +24,18 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lastSpokenText: String = ""
     @Published var transcribedQuery: String = ""
 
+    // MARK: - Audio alerts mute
+    /// When true the spoken obstacle warnings are suppressed; visual banner still shows.
+    @Published var alertsMuted: Bool = false
+
+    // MARK: - Detection pipeline mode
+    /// Active server-side pipeline.  Mirrors the server's _pipeline_mode.
+    /// "yolo" | "gdino" | "both"
+    @Published var pipelineMode: String = "yolo"
+    /// Comma-separated open-vocabulary targets, e.g. "wheelchair, service dog".
+    /// Sent to the server via set_targets when non-empty and mode != "yolo".
+    @Published var detectionTargets: String = ""
+
     // MARK: - Recording (owned here so ContentView can observe it)
     let recordingManager = RecordingManager()
 
@@ -144,6 +156,20 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         isStreaming = true
         statusMessage = "Connected to \(url.host ?? "server")"
         listenForMessages()
+
+        // Restore pipeline mode and targets on (re-)connect.
+        // Small delay lets the WebSocket handshake complete first.
+        if pipelineMode != "yolo" || !detectionTargets.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self else { return }
+                if self.pipelineMode != "yolo" {
+                    self.setPipelineMode(self.pipelineMode)
+                }
+                if !self.detectionTargets.isEmpty {
+                    self.setDetectionTargets(self.detectionTargets)
+                }
+            }
+        }
     }
 
     func disconnectWebSocket() {
@@ -178,9 +204,14 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             let msgType = json["type"] as? String
 
             if let warning = json["warning"] as? String {
-                speakWithCooldown(warning)
+                // Visual banner always updates; speech is suppressed when muted.
+                DispatchQueue.main.async { self.lastSpokenText = warning }
+                if !alertsMuted {
+                    speakWithCooldown(warning)
+                }
             }
             if msgType == "query_response", let answer = json["answer"] as? String {
+                // Query responses always speak (they're user-initiated).
                 speakForced(answer)
             }
 
@@ -319,6 +350,55 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         let socket = webSocket
         Task { try? await socket?.send(.string(jsonString)) }
         print("Sent voice query: \(query)")
+    }
+
+    // MARK: - Pipeline / Target control
+
+    /// Send any JSON string to the server (fire-and-forget).
+    /// Silently no-ops if the WebSocket is not connected.
+    func sendTextMessage(_ text: String) {
+        guard let socket = webSocket else { return }
+        Task { try? await socket.send(.string(text)) }
+    }
+
+    /// Switch the server-side detection pipeline.
+    /// - "yolo"  — YOLO only (fast, COCO classes)
+    /// - "gdino" — Grounding DINO only (open-vocabulary targets, no YOLO)
+    /// - "both"  — YOLO always + GDINO for user targets (highest coverage)
+    func setPipelineMode(_ mode: String) {
+        pipelineMode = mode
+        guard isStreaming else { return }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "type": "set_pipeline",
+            "mode": mode,
+        ]), let text = String(data: data, encoding: .utf8) else { return }
+        sendTextMessage(text)
+
+        // Re-send targets whenever switching to a GDINO-capable mode.
+        if mode != "yolo" && !detectionTargets.isEmpty {
+            setDetectionTargets(detectionTargets)
+        }
+    }
+
+    /// Push the current detection targets to the server.
+    /// Parses the comma-separated `targetsString`, trims whitespace,
+    /// and sends {"type":"set_targets","objects":[…]}.
+    func setDetectionTargets(_ targetsString: String) {
+        detectionTargets = targetsString
+        guard isStreaming else { return }
+
+        let objects = targetsString
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "type": "set_targets",
+            "objects": objects,
+        ] as [String: Any]), let text = String(data: data, encoding: .utf8) else { return }
+        sendTextMessage(text)
+        print("[Pipeline] targets → \(objects)")
     }
 
     // MARK: - ARSessionDelegate — Frame Processing

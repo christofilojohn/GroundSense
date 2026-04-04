@@ -117,6 +117,23 @@ private struct TopBar: View {
                 )
             }
 
+            // Mute toggle — silences obstacle warning speech; visual banner stays on
+            Button(action: { captureManager.alertsMuted.toggle() }) {
+                Image(systemName: captureManager.alertsMuted
+                      ? "speaker.slash.fill"
+                      : "speaker.wave.2.fill")
+                    .font(.caption)
+                    .foregroundColor(captureManager.alertsMuted
+                                     ? .orange
+                                     : .white.opacity(0.8))
+                    .padding(6)
+                    .background(captureManager.alertsMuted
+                                ? Color.orange.opacity(0.2)
+                                : Color.black.opacity(0.35))
+                    .cornerRadius(7)
+            }
+            .accessibilityLabel(captureManager.alertsMuted ? "Unmute alerts" : "Mute alerts")
+
             Text("\(Int(captureManager.fps)) FPS")
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.white)
@@ -353,6 +370,11 @@ private struct BottomControls: View {
                              fps: Double(captureManager.targetFPS))
                     .disabled(!captureManager.isRunning)
             }
+
+            // ── Row 3: Detection pipeline (shown when running) ───────
+            if captureManager.isRunning {
+                PipelineControls(captureManager: captureManager)
+            }
         }
         .padding()
         .background(
@@ -362,6 +384,99 @@ private struct BottomControls: View {
                 endPoint: .bottom
             )
         )
+    }
+}
+
+// MARK: - Pipeline Controls
+
+/// Segmented picker to switch between YOLO / GDINO / Both detection modes,
+/// with an optional targets text field shown for GDINO-capable modes.
+private struct PipelineControls: View {
+    @ObservedObject var captureManager: ARCaptureManager
+
+    // Local draft of the targets string; committed on Return or the arrow button.
+    @State private var targetsDraft: String = ""
+    @FocusState private var targetsFieldFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 8) {
+
+            // ── Mode picker ───────────────────────────────────────────
+            HStack(spacing: 0) {
+                PipelineModeButton(label: "YOLO",  tag: "yolo",  current: captureManager.pipelineMode) {
+                    captureManager.setPipelineMode("yolo")
+                }
+                PipelineModeButton(label: "GDINO", tag: "gdino", current: captureManager.pipelineMode) {
+                    captureManager.setPipelineMode("gdino")
+                    targetsDraft = captureManager.detectionTargets
+                }
+                PipelineModeButton(label: "Both",  tag: "both",  current: captureManager.pipelineMode) {
+                    captureManager.setPipelineMode("both")
+                    targetsDraft = captureManager.detectionTargets
+                }
+            }
+            .background(Color.white.opacity(0.1))
+            .cornerRadius(10)
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.2), lineWidth: 1))
+
+            // ── Target objects field (GDINO / Both only) ──────────────
+            if captureManager.pipelineMode != "yolo" {
+                HStack(spacing: 8) {
+                    Image(systemName: "text.magnifyingglass")
+                        .foregroundColor(.white.opacity(0.6))
+                        .font(.caption)
+
+                    TextField("wheelchair, service dog, fire hydrant…",
+                              text: $targetsDraft)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundColor(.white)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .focused($targetsFieldFocused)
+                        .onSubmit { commitTargets() }
+
+                    // Send button
+                    Button(action: { commitTargets(); targetsFieldFocused = false }) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .foregroundColor(targetsDraft.isEmpty ? .white.opacity(0.3) : .blue)
+                            .font(.title3)
+                    }
+                    .disabled(targetsDraft.isEmpty)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.1))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.2), lineWidth: 1))
+                .onAppear { targetsDraft = captureManager.detectionTargets }
+            }
+        }
+    }
+
+    private func commitTargets() {
+        captureManager.setDetectionTargets(targetsDraft)
+    }
+}
+
+private struct PipelineModeButton: View {
+    let label: String
+    let tag: String
+    let current: String
+    let action: () -> Void
+
+    var isSelected: Bool { current == tag }
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption.weight(isSelected ? .semibold : .regular))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(isSelected ? Color.blue.opacity(0.75) : Color.clear)
+                .foregroundColor(isSelected ? .white : .white.opacity(0.65))
+        }
+        .cornerRadius(isSelected ? 10 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isSelected)
     }
 }
 
