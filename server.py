@@ -1622,11 +1622,11 @@ async def _serve(host: str, port: int, server: "GroundSenseServer",
 
 def main(host: str, port: int, model: str, device: str, visualize: bool,
          llm: str, gemini_key: str,
-         open_vocab: bool = True, gdino_interval: int = 5):
+         open_vocab: bool = True, gdino_interval: int = 5,inference_interval: int = 5):
     server = GroundSenseServer(
         model_name=model, device=device, visualize=visualize,
         llm=llm, gemini_key=gemini_key,
-        open_vocab=open_vocab, gdino_interval=gdino_interval,
+        open_vocab=open_vocab, gdino_interval=gdino_interval,inference_interval=inference_interval,
     )
     logger.info(f"Starting GroundSense server on ws://{host}:{port}")
     ov_status = (
@@ -1718,6 +1718,10 @@ if __name__ == "__main__":
                         help="Query engine: gemini (default) | none (rule-based)")
     parser.add_argument("--gemini-key", default="",
                         help="Gemini API key (overrides GEMINI_API_KEY env var)")
+    parser.add_argument(
+    "--inference-interval", type=int, default=5, metavar="N",
+    help="Run YOLO inference every N frames (default 5). "
+         "All frames are still displayed and sent to the client.",)
 
     # ── Open-vocabulary detection (Grounding DINO + MobileSAM) ──
     ov_group = parser.add_mutually_exclusive_group()
