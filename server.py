@@ -544,6 +544,11 @@ class OpenVocabPipeline:
     # ── Inference ─────────────────────────────────────────────────────
 
     def _run_gdino(self, frame: "Frame") -> list[DetectedObject]:
+        # Defensive guard: some callers invoke this helper directly from an
+        # executor, so make sure lazy model loading has happened first.
+        if not self._ensure_loaded():
+            return list(self._cached)
+
         import torch
         from PIL import Image as PILImage
 
@@ -1378,7 +1383,10 @@ class GroundSenseServer:
                 scene.free_direction = self.pipeline._estimate_free_direction_lidar(
                     frame.depth, []
                 )
-                if self.open_vocab.target_objects:
+                if (
+                    self.open_vocab.target_objects
+                    and self.open_vocab._ensure_loaded()
+                ):
                     ov_objects = await loop.run_in_executor(
                         self._gpu_executor, self.open_vocab._run_gdino, frame
                     )
