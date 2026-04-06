@@ -66,6 +66,19 @@ python fake_client.py --display --fps 3
 python fake_client.py --query "what is in front of me?"
 ```
 
+## Benchmarking
+
+Use the included NYU subset to time each stage of the backend pipeline:
+
+```bash
+# Single device
+python benchmark.py --device cpu
+python benchmark.py --device cuda
+
+# Run the same benchmark suite on CPU and CUDA back-to-back
+python benchmark_devices.py --frames 30 --warmup 5
+```
+
 ## Requirements
 
 - **iPhone**: iPhone 12 Pro or later (LiDAR required)
