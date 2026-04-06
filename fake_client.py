@@ -23,6 +23,9 @@ Usage:
     # Replay at a different speed (default: use the recorded fps)
     python fake_client.py --recording my_walk.gsrecording --replay-fps 5
 
+    # Replay with open-vocabulary detection enabled alongside YOLO
+    python fake_client.py --recording my_walk.gsrecording --pipeline both --targets "wheelchair,wet floor sign"
+
 Wire format (must match Frame.from_bytes in server.py):
     [4B jpeg_size uint32LE][jpeg_bytes]
     [4B depth_size uint32LE][depth_float16_bytes]
@@ -38,6 +41,8 @@ Wire format (must match Frame.from_bytes in server.py):
       [28:32] flags    UInt32 LE = 0
     Followed by frameCount wire-format frame packets (same layout as above).
 """
+
+from __future__ import annotations
 
 import asyncio
 import argparse
@@ -425,12 +430,39 @@ async def _send_set_targets(ws, targets_str: str) -> None:
         log.warning("[OpenVocab] No ack received within 5 s — continuing anyway")
 
 
+async def _send_set_pipeline(ws, pipeline_mode: str) -> None:
+    """
+    Switch the server pipeline mode before streaming starts.
+    No-op when pipeline_mode is "keep".
+    """
+    mode = pipeline_mode.strip().lower()
+    if mode == "keep":
+        return
+
+    msg = json.dumps({"type": "set_pipeline", "mode": mode})
+    log.info(f"[Pipeline] Requesting mode: {mode}")
+    await ws.send(msg)
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        ack = json.loads(raw)
+        if ack.get("type") == "set_pipeline_ack":
+            if ack.get("ok"):
+                log.info(f"[Pipeline] Server mode confirmed: {ack.get('mode')}")
+            else:
+                log.warning(f"[Pipeline] Server rejected mode '{mode}': {ack.get('error')}")
+        else:
+            log.warning(f"[Pipeline] Unexpected response to set_pipeline: {raw[:120]}")
+    except asyncio.TimeoutError:
+        log.warning("[Pipeline] No ack received within 5 s — continuing anyway")
+
+
 async def stream_gsrecording(
     server: str,
     recording_path: str,
     fps_override: float | None = None,
     query: str = "",
     targets: str = "",
+    pipeline: str = "keep",
 ):
     """Replay a .gsrecording file to the GroundSense server."""
     fps, packets = read_gsrecording(recording_path)
@@ -441,6 +473,7 @@ async def stream_gsrecording(
 
     log.info(f"Connecting to {server} …")
     async with websockets.connect(server, max_size=10 * 1024 * 1024) as ws:
+        await _send_set_pipeline(ws, pipeline)
         # Activate open-vocab targets before the first frame
         await _send_set_targets(ws, targets)
         log.info(f"Connected. Replaying {len(packets)} frames at {fps:.1f} fps")
@@ -501,6 +534,7 @@ async def main_async(args):
             fps_override=args.replay_fps if args.replay_fps > 0 else None,
             query=args.query,
             targets=args.targets,
+            pipeline=args.pipeline,
         )
         return
 
@@ -525,6 +559,7 @@ async def main_async(args):
         async with websockets.connect(
             args.server, max_size=10 * 1024 * 1024
         ) as ws:
+            await _send_set_pipeline(ws, args.pipeline)
             # Activate open-vocab targets before the first frame
             await _send_set_targets(ws, args.targets)
             log.info(
@@ -691,6 +726,17 @@ def main():
             "Sent to the server before streaming starts. "
             "Requires --open-vocab on the server (enabled by default). "
             "Leave empty for YOLO-only mode."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=["keep", "yolo", "gdino", "both"],
+        default="keep",
+        help=(
+            "Detection pipeline to request from the server before streaming. "
+            "'keep' leaves the current server mode unchanged (default). "
+            "'yolo' = YOLO-only, 'gdino' = open-vocab only, "
+            "'both' = YOLO + open-vocab."
         ),
     )
 
