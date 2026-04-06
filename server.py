@@ -18,6 +18,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import json
 import struct
 import argparse
@@ -185,17 +186,27 @@ class SegmentationPipeline:
         self.device = device
         logger.info("Model loaded successfully")
 
-    def process_frame(self, frame: Frame) -> SceneState:
-        """Run segmentation + depth fusion on a single frame."""
+    def preprocess_depth(self, depth: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """CPU-only bilateral filter on the LiDAR depth map — can run concurrently."""
+        if depth is None:
+            return None
+        return cv2.bilateralFilter(depth, d=7, sigmaColor=0.15, sigmaSpace=5)
+
+    def process_frame(self, frame: Frame,
+                      preprocessed_depth: Optional[np.ndarray] = None) -> SceneState:
+        """Run segmentation + depth fusion on a single frame.
+
+        If *preprocessed_depth* is supplied (already bilateral-filtered), the
+        internal depth preprocessing step is skipped so that it can be
+        overlapped with other work by the caller.
+        """
         h, w = frame.rgb.shape[:2]
 
-        # ── Depth pre-processing ──────────────────────────────────────
-        # Bilateral filter: edge-preserving denoise on the LiDAR depth map.
-        # sigmaColor=0.15 → blur depth values within 15 cm of each other.
-        # sigmaSpace=5    → consider pixels within a 5-pixel spatial radius.
-        depth = frame.depth
-        if depth is not None:
-            depth = cv2.bilateralFilter(depth, d=7, sigmaColor=0.15, sigmaSpace=5)
+        # ── Depth (use pre-processed if provided, else filter here) ──
+        if preprocessed_depth is not None:
+            depth = preprocessed_depth
+        else:
+            depth = self.preprocess_depth(frame.depth)
 
         # ── RGB pre-resize for YOLO ───────────────────────────────────
         # YOLO internally rescales to imgsz=640 anyway; pre-resizing avoids
@@ -221,6 +232,13 @@ class SegmentationPipeline:
             boxes = result.boxes
             masks = result.masks
 
+            # Pre-compute depth validity mask once for all detections
+            depth_valid = None
+            dh = dw = 0
+            if depth is not None:
+                dh, dw = depth.shape
+                depth_valid = (depth > 0.1) & (depth < 10)
+
             for i in range(len(boxes)):
                 box = boxes[i]
                 cls_id = int(box.cls[0])
@@ -240,34 +258,32 @@ class SegmentationPipeline:
                 else:
                     direction = "center"
 
-                # Distance from LiDAR depth (using the bilaterally-filtered map)
+                # ── Depth + contour from the same mask decode ─────────
+                # Decode the mask once and reuse for both depth sampling and
+                # contour extraction — avoids a second .cpu().numpy() call.
                 distance = float("inf")
-                if depth is not None and masks is not None:
-                    mask = masks[i].data[0].cpu().numpy()  # (H_mask, W_mask)
-                    # Resize mask to depth map dimensions
-                    dh, dw = depth.shape
-                    mask_resized = cv2.resize(
-                        mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST
-                    )
-                    # Get depth values within the mask
-                    depth_values = depth[mask_resized > 0.5]
-                    depth_values = depth_values[(depth_values > 0.1) & (depth_values < 10)]
-                    if len(depth_values) > 0:
-                        distance = float(np.median(depth_values))
-
-                # ── Extract mask contour for visualizer overlay ──────
                 contour_pts = None
                 if masks is not None:
                     raw_mask = masks[i].data[0].cpu().numpy()  # float32 [0,1]
                     mh, mw = raw_mask.shape
                     bin_mask = (raw_mask > 0.5).astype(np.uint8)
+
+                    if depth_valid is not None:
+                        mask_resized = cv2.resize(
+                            bin_mask, (dw, dh), interpolation=cv2.INTER_NEAREST
+                        )
+                        # Reuse pre-computed validity mask
+                        depth_values = depth[mask_resized.astype(bool) & depth_valid]
+                        if len(depth_values) > 0:
+                            distance = float(np.median(depth_values))
+
+                    # Contour extraction (landscape-normalised coords)
                     cnts, _ = cv2.findContours(bin_mask, cv2.RETR_EXTERNAL,
                                                cv2.CHAIN_APPROX_SIMPLE)
                     if cnts:
                         biggest = max(cnts, key=cv2.contourArea)
                         eps = 0.02 * cv2.arcLength(biggest, True)
                         approx = cv2.approxPolyDP(biggest, eps, True)
-                        # Normalise to [0,1] in landscape frame
                         contour_pts = [(float(p[0][0]) / mw,
                                         float(p[0][1]) / mh)
                                        for p in approx]
@@ -1134,6 +1150,18 @@ class GroundSenseServer:
         self.last_scene: Optional[SceneState] = None
         self.inference_interval = inference_interval
 
+        # ── Dedicated thread-pool executors ──────────────────────────
+        # A single-worker GPU executor ensures the CUDA device is driven by
+        # exactly one thread, preventing context-switch overhead and letting
+        # PyTorch/CUDA batch work optimally.  A separate CPU executor handles
+        # depth pre-processing so it can overlap with other work.
+        self._gpu_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gpu-worker"
+        )
+        self._cpu_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="cpu-worker"
+        )
+
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
         logger.info(f"Client connected: {client_addr}")
@@ -1237,7 +1265,20 @@ class GroundSenseServer:
     #             f"Free: {scene.free_direction}"
     #         )
     async def _process_frame(self, websocket, data: bytes):
-        """Process a binary frame packet."""
+        """Process a binary frame packet.
+
+        Parallelization strategy
+        ────────────────────────
+        1. Depth bilateral-filter (CPU) is dispatched to _cpu_executor
+           immediately after frame decode so it overlaps with Python overhead.
+        2. YOLO inference (GPU) runs on _gpu_executor (max_workers=1) so that
+           exactly one thread drives the CUDA device — no context-switch waste.
+        3. In "both" mode YOLO and GDINO run concurrently via asyncio.gather,
+           each on its own executor, maximising GPU throughput.
+        4. "gdino"-only mode still uses the dedicated GPU executor.
+        5. Per-detection postprocessing reuses a pre-computed depth validity
+           mask (done inside process_frame) to halve redundant numpy work.
+        """
         self.frame_count += 1
 
         try:
@@ -1249,34 +1290,103 @@ class GroundSenseServer:
         loop = asyncio.get_event_loop()
         mode = self._pipeline_mode
 
-        # ── Frame skipping: run inference every 5th frame, reuse cached scene otherwise ──
-        run_inference = (self.frame_count % self.inference_interval == 0) or self.last_scene is None
+        # ── Frame skipping ────────────────────────────────────────────
+        run_inference = (
+            (self.frame_count % self.inference_interval == 0)
+            or self.last_scene is None
+        )
 
         if run_inference:
-            if mode in ("yolo", "both"):
-                scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
-            else:
-                scene = SceneState(timestamp=frame.timestamp)
-                scene.free_direction = self.pipeline._estimate_free_direction_lidar(
-                    frame.depth, []
-                )
+            # ── 1. Start depth preprocessing on CPU executor immediately ──
+            # This overlaps with any remaining Python overhead before the GPU
+            # call starts.  Cost: ~0.5–2 ms on a typical LiDAR map.
+            depth_future = loop.run_in_executor(
+                self._cpu_executor,
+                self.pipeline.preprocess_depth,
+                frame.depth,
+            )
 
-            # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
-            if (self._open_vocab_enabled
-                    and mode in ("gdino", "both")
-                    and self.open_vocab.target_objects):
-                ov_objects = list(self.open_vocab._cached)
+            if mode == "both" and (
+                self._open_vocab_enabled
+                and self.open_vocab.target_objects
+                and self.open_vocab._ensure_loaded()
+            ):
+                # ── 2a. YOLO + GDINO truly in parallel ───────────────
+                # Both are GPU-bound; on a single GPU they serialise on the
+                # CUDA side, but their Python overhead (pre/post-processing)
+                # runs concurrently, which is a net win.
+                preprocessed_depth = await depth_future
+
+                def _yolo_with_depth():
+                    return self.pipeline.process_frame(
+                        frame, preprocessed_depth=preprocessed_depth
+                    )
+
+                yolo_coro  = loop.run_in_executor(self._gpu_executor, _yolo_with_depth)
+                gdino_coro = loop.run_in_executor(
+                    self._cpu_executor, self.open_vocab._run_gdino, frame
+                )
+                scene, ov_objects = await asyncio.gather(yolo_coro, gdino_coro)
+
+                # Update GDINO cache and merge into scene
+                self.open_vocab._cached = ov_objects
                 if ov_objects:
                     scene.objects.extend(ov_objects)
                     scene.objects.sort(key=lambda o: o.distance_m)
                     scene.closest_obstacle_m = scene.objects[0].distance_m
 
-                self.open_vocab._frame_count += 1
-                if (self.open_vocab._frame_count % self.open_vocab.interval == 0
+            elif mode in ("yolo", "both"):
+                # ── 2b. YOLO only (GDINO fires in background if due) ──
+                preprocessed_depth = await depth_future
+
+                def _yolo_with_depth():
+                    return self.pipeline.process_frame(
+                        frame, preprocessed_depth=preprocessed_depth
+                    )
+
+                scene = await loop.run_in_executor(
+                    self._gpu_executor, _yolo_with_depth
+                )
+
+                # GDINO background task (throttled, non-blocking)
+                if (
+                    self._open_vocab_enabled
+                    and mode == "both"
+                    and self.open_vocab.target_objects
+                ):
+                    ov_objects = list(self.open_vocab._cached)
+                    if ov_objects:
+                        scene.objects.extend(ov_objects)
+                        scene.objects.sort(key=lambda o: o.distance_m)
+                        scene.closest_obstacle_m = scene.objects[0].distance_m
+
+                    self.open_vocab._frame_count += 1
+                    if (
+                        self.open_vocab._frame_count % self.open_vocab.interval == 0
                         and not self._gdino_running
-                        and self.open_vocab._ensure_loaded()):
-                    self._gdino_running = True
-                    asyncio.create_task(self._run_gdino_background(frame))
+                        and self.open_vocab._ensure_loaded()
+                    ):
+                        self._gdino_running = True
+                        asyncio.create_task(self._run_gdino_background(frame))
+
+            else:
+                # ── 2c. GDINO-only mode ───────────────────────────────
+                # Don't need the filtered depth here (no YOLO postprocessing),
+                # but cancel the future to free the worker if depth was None.
+                depth_future.cancel()
+                scene = SceneState(timestamp=frame.timestamp)
+                scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+                    frame.depth, []
+                )
+                if self.open_vocab.target_objects:
+                    ov_objects = await loop.run_in_executor(
+                        self._gpu_executor, self.open_vocab._run_gdino, frame
+                    )
+                    self.open_vocab._cached = ov_objects
+                    scene.objects = ov_objects
+                    scene.objects.sort(key=lambda o: o.distance_m)
+                    if scene.objects:
+                        scene.closest_obstacle_m = scene.objects[0].distance_m
 
             self.last_scene = scene
         else:
@@ -1443,7 +1553,7 @@ class GroundSenseServer:
                 f"targets={self.open_vocab.target_objects})"
             )
             result = await loop.run_in_executor(
-                None, self.open_vocab._run_gdino, frame
+                self._gpu_executor, self.open_vocab._run_gdino, frame
             )
             self.open_vocab._cached = result
             if result:
