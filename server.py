@@ -1136,11 +1136,13 @@ class GroundSenseServer:
 
     def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu",
                  visualize: bool = False, llm: str = "gemini", gemini_key: str = "",
-                 open_vocab: bool = True, gdino_interval: int = 5,inference_interval: int = 5):
+                 open_vocab: bool = True, gdino_interval: int = 5,
+                 inference_interval: int = 5, architecture: str = "parallel"):
         self.pipeline     = SegmentationPipeline(model_name=model_name, device=device)
         self.open_vocab   = OpenVocabPipeline(device=device, interval=gdino_interval)
         self.response_gen = ResponseGenerator(llm=llm, gemini_key=gemini_key)
         self._open_vocab_enabled = open_vocab
+        self.architecture = architecture
         # Active detection mode: "yolo" | "gdino" | "both"
         # Changed at runtime via {"type": "set_pipeline", "mode": "..."}
         self._pipeline_mode: str = "yolo"
@@ -1166,6 +1168,16 @@ class GroundSenseServer:
         self._cpu_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="cpu-worker"
         )
+
+    def _merge_open_vocab_objects(
+        self, scene: SceneState, ov_objects: list[DetectedObject]
+    ) -> None:
+        if not ov_objects:
+            return
+
+        scene.objects.extend(ov_objects)
+        scene.objects.sort(key=lambda o: o.distance_m)
+        scene.closest_obstacle_m = scene.objects[0].distance_m
 
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
@@ -1269,21 +1281,164 @@ class GroundSenseServer:
     #             f"Closest: {scene.closest_obstacle_m:.1f}m | "
     #             f"Free: {scene.free_direction}"
     #         )
-    async def _process_frame(self, websocket, data: bytes):
-        """Process a binary frame packet.
-
-        Parallelization strategy
-        ────────────────────────
-        1. Depth bilateral-filter (CPU) is dispatched to _cpu_executor
-           immediately after frame decode so it overlaps with Python overhead.
-        2. YOLO inference (GPU) runs on _gpu_executor (max_workers=1) so that
-           exactly one thread drives the CUDA device — no context-switch waste.
-        3. In "both" mode YOLO and GDINO run concurrently via asyncio.gather,
-           each on its own executor, maximising GPU throughput.
-        4. "gdino"-only mode still uses the dedicated GPU executor.
-        5. Per-detection postprocessing reuses a pre-computed depth validity
-           mask (done inside process_frame) to halve redundant numpy work.
+    async def _build_scene_parallel(self, frame: "Frame", loop, mode: str) -> SceneState:
         """
+        Process a frame with the parallelized executor architecture.
+
+        This path can skip fresh inference work on intermediate frames and reuse
+        the previous scene, controlled by `inference_interval`.
+        """
+        # ── Frame skipping ────────────────────────────────────────────
+        run_inference = (
+            (self.frame_count % self.inference_interval == 0)
+            or self.last_scene is None
+        )
+
+        if not run_inference:
+            scene = self.last_scene
+            scene.timestamp = frame.timestamp
+            return scene
+
+        # ── 1. Start depth preprocessing on CPU executor immediately ──
+        # This overlaps with any remaining Python overhead before the GPU
+        # call starts.  Cost: ~0.5–2 ms on a typical LiDAR map.
+        depth_future = loop.run_in_executor(
+            self._cpu_executor,
+            self.pipeline.preprocess_depth,
+            frame.depth,
+        )
+
+        if mode == "both" and (
+            self._open_vocab_enabled
+            and self.open_vocab.target_objects
+            and self.open_vocab._ensure_loaded()
+        ):
+            # ── 2a. YOLO + GDINO truly in parallel ───────────────
+            # Both are GPU-bound; on a single GPU they serialise on the
+            # CUDA side, but their Python overhead (pre/post-processing)
+            # runs concurrently, which is a net win.
+            preprocessed_depth = await depth_future
+
+            def _yolo_with_depth():
+                return self.pipeline.process_frame(
+                    frame, preprocessed_depth=preprocessed_depth
+                )
+
+            yolo_coro  = loop.run_in_executor(self._gpu_executor, _yolo_with_depth)
+            gdino_coro = loop.run_in_executor(
+                self._cpu_executor, self.open_vocab._run_gdino, frame
+            )
+            scene, ov_objects = await asyncio.gather(yolo_coro, gdino_coro)
+
+            # Update GDINO cache and merge into scene
+            self.open_vocab._cached = ov_objects
+            self._merge_open_vocab_objects(scene, ov_objects)
+
+        elif mode in ("yolo", "both"):
+            # ── 2b. YOLO only (GDINO fires in background if due) ──
+            preprocessed_depth = await depth_future
+
+            def _yolo_with_depth():
+                return self.pipeline.process_frame(
+                    frame, preprocessed_depth=preprocessed_depth
+                )
+
+            scene = await loop.run_in_executor(
+                self._gpu_executor, _yolo_with_depth
+            )
+
+            # GDINO background task (throttled, non-blocking)
+            if (
+                self._open_vocab_enabled
+                and mode == "both"
+                and self.open_vocab.target_objects
+            ):
+                ov_objects = list(self.open_vocab._cached)
+                self._merge_open_vocab_objects(scene, ov_objects)
+
+                self.open_vocab._frame_count += 1
+                if (
+                    self.open_vocab._frame_count % self.open_vocab.interval == 0
+                    and not self._gdino_running
+                    and self.open_vocab._ensure_loaded()
+                ):
+                    self._gdino_running = True
+                    asyncio.create_task(self._run_gdino_background(frame))
+
+        else:
+            # ── 2c. GDINO-only mode ───────────────────────────────
+            # Don't need the filtered depth here (no YOLO postprocessing),
+            # but cancel the future to free the worker if depth was None.
+            depth_future.cancel()
+            scene = SceneState(timestamp=frame.timestamp)
+            scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+                frame.depth, []
+            )
+            if (
+                self.open_vocab.target_objects
+                and self.open_vocab._ensure_loaded()
+            ):
+                ov_objects = await loop.run_in_executor(
+                    self._gpu_executor, self.open_vocab._run_gdino, frame
+                )
+                self.open_vocab._cached = ov_objects
+                scene.objects = ov_objects
+                scene.objects.sort(key=lambda o: o.distance_m)
+                if scene.objects:
+                    scene.closest_obstacle_m = scene.objects[0].distance_m
+
+        return scene
+
+    async def _build_scene_serial(self, frame: "Frame", loop, mode: str) -> SceneState:
+        """
+        Process a frame with the main-branch style serial architecture.
+
+        YOLO runs for every frame when enabled, while GDINO contributes cached
+        results immediately and refreshes in the background when due.
+        """
+        # ── Primary pipeline: YOLO ────────────────────────────────────
+        # Runs synchronous inference in a thread so the event loop stays free.
+        # Skipped in "gdino" mode to reduce CPU/GPU load.
+        if mode in ("yolo", "both"):
+            scene = await loop.run_in_executor(
+                self._gpu_executor, self.pipeline.process_frame, frame
+            )
+        else:
+            # GDINO-only: build a blank scene and still estimate free direction
+            # from the raw LiDAR depth map (no bilateral filter, but accurate enough).
+            scene = SceneState(timestamp=frame.timestamp)
+            scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+                frame.depth, []
+            )
+
+        # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
+        # GDINO inference takes ~500–2000 ms on CPU, far too slow to await
+        # on every frame.  Instead:
+        #   • Merge the cached result from the last completed inference
+        #     into this frame's scene immediately.
+        #   • Every `interval` frames, if no inference is already running,
+        #     fire a background task and update the cache when done.
+        if (
+            self._open_vocab_enabled
+            and mode in ("gdino", "both")
+            and self.open_vocab.target_objects
+        ):
+            ov_objects = list(self.open_vocab._cached)
+            self._merge_open_vocab_objects(scene, ov_objects)
+
+            self.open_vocab._frame_count += 1
+            if (
+                self.open_vocab._frame_count % self.open_vocab.interval == 0
+                and not self._gdino_running
+                and self.open_vocab._ensure_loaded()
+            ):
+                self._gdino_running = True
+                asyncio.create_task(self._run_gdino_background(frame))
+
+        return scene
+
+    async def _process_frame(self, websocket, data: bytes):
+        """Process a binary frame packet."""
         self.frame_count += 1
 
         try:
@@ -1295,112 +1450,12 @@ class GroundSenseServer:
         loop = asyncio.get_event_loop()
         mode = self._pipeline_mode
 
-        # ── Frame skipping ────────────────────────────────────────────
-        run_inference = (
-            (self.frame_count % self.inference_interval == 0)
-            or self.last_scene is None
-        )
-
-        if run_inference:
-            # ── 1. Start depth preprocessing on CPU executor immediately ──
-            # This overlaps with any remaining Python overhead before the GPU
-            # call starts.  Cost: ~0.5–2 ms on a typical LiDAR map.
-            depth_future = loop.run_in_executor(
-                self._cpu_executor,
-                self.pipeline.preprocess_depth,
-                frame.depth,
-            )
-
-            if mode == "both" and (
-                self._open_vocab_enabled
-                and self.open_vocab.target_objects
-                and self.open_vocab._ensure_loaded()
-            ):
-                # ── 2a. YOLO + GDINO truly in parallel ───────────────
-                # Both are GPU-bound; on a single GPU they serialise on the
-                # CUDA side, but their Python overhead (pre/post-processing)
-                # runs concurrently, which is a net win.
-                preprocessed_depth = await depth_future
-
-                def _yolo_with_depth():
-                    return self.pipeline.process_frame(
-                        frame, preprocessed_depth=preprocessed_depth
-                    )
-
-                yolo_coro  = loop.run_in_executor(self._gpu_executor, _yolo_with_depth)
-                gdino_coro = loop.run_in_executor(
-                    self._cpu_executor, self.open_vocab._run_gdino, frame
-                )
-                scene, ov_objects = await asyncio.gather(yolo_coro, gdino_coro)
-
-                # Update GDINO cache and merge into scene
-                self.open_vocab._cached = ov_objects
-                if ov_objects:
-                    scene.objects.extend(ov_objects)
-                    scene.objects.sort(key=lambda o: o.distance_m)
-                    scene.closest_obstacle_m = scene.objects[0].distance_m
-
-            elif mode in ("yolo", "both"):
-                # ── 2b. YOLO only (GDINO fires in background if due) ──
-                preprocessed_depth = await depth_future
-
-                def _yolo_with_depth():
-                    return self.pipeline.process_frame(
-                        frame, preprocessed_depth=preprocessed_depth
-                    )
-
-                scene = await loop.run_in_executor(
-                    self._gpu_executor, _yolo_with_depth
-                )
-
-                # GDINO background task (throttled, non-blocking)
-                if (
-                    self._open_vocab_enabled
-                    and mode == "both"
-                    and self.open_vocab.target_objects
-                ):
-                    ov_objects = list(self.open_vocab._cached)
-                    if ov_objects:
-                        scene.objects.extend(ov_objects)
-                        scene.objects.sort(key=lambda o: o.distance_m)
-                        scene.closest_obstacle_m = scene.objects[0].distance_m
-
-                    self.open_vocab._frame_count += 1
-                    if (
-                        self.open_vocab._frame_count % self.open_vocab.interval == 0
-                        and not self._gdino_running
-                        and self.open_vocab._ensure_loaded()
-                    ):
-                        self._gdino_running = True
-                        asyncio.create_task(self._run_gdino_background(frame))
-
-            else:
-                # ── 2c. GDINO-only mode ───────────────────────────────
-                # Don't need the filtered depth here (no YOLO postprocessing),
-                # but cancel the future to free the worker if depth was None.
-                depth_future.cancel()
-                scene = SceneState(timestamp=frame.timestamp)
-                scene.free_direction = self.pipeline._estimate_free_direction_lidar(
-                    frame.depth, []
-                )
-                if (
-                    self.open_vocab.target_objects
-                    and self.open_vocab._ensure_loaded()
-                ):
-                    ov_objects = await loop.run_in_executor(
-                        self._gpu_executor, self.open_vocab._run_gdino, frame
-                    )
-                    self.open_vocab._cached = ov_objects
-                    scene.objects = ov_objects
-                    scene.objects.sort(key=lambda o: o.distance_m)
-                    if scene.objects:
-                        scene.closest_obstacle_m = scene.objects[0].distance_m
-
-            self.last_scene = scene
+        if self.architecture == "serial":
+            scene = await self._build_scene_serial(frame, loop, mode)
         else:
-            # Skipped frame — reuse the last scene but update its timestamp
-            scene = self.last_scene
-            scene.timestamp = frame.timestamp
+            scene = await self._build_scene_parallel(frame, loop, mode)
+
+        self.last_scene = scene
 
         # ── Everything below runs for ALL frames (display + warnings + send) ──
 
@@ -1740,18 +1795,23 @@ async def _serve(host: str, port: int, server: "GroundSenseServer",
 
 def main(host: str, port: int, model: str, device: str, visualize: bool,
          llm: str, gemini_key: str,
-         open_vocab: bool = True, gdino_interval: int = 5,inference_interval: int = 5):
+         open_vocab: bool = True, gdino_interval: int = 5,
+         inference_interval: int = 5, architecture: str = "parallel"):
     server = GroundSenseServer(
         model_name=model, device=device, visualize=visualize,
         llm=llm, gemini_key=gemini_key,
-        open_vocab=open_vocab, gdino_interval=gdino_interval,inference_interval=inference_interval,
+        open_vocab=open_vocab,
+        gdino_interval=gdino_interval,
+        inference_interval=inference_interval,
+        architecture=architecture,
     )
     logger.info(f"Starting GroundSense server on ws://{host}:{port}")
     ov_status = (
         f"enabled (interval={gdino_interval} frames)" if open_vocab else "disabled"
     )
     logger.info(
-        f"Model: {model} | Device: {device} | LLM: {llm} | OpenVocab: {ov_status}"
+        f"Model: {model} | Device: {device} | LLM: {llm} | "
+        f"Architecture: {architecture} | OpenVocab: {ov_status}"
         + (" | Visualizer: ON  (press q to quit)" if visualize else "")
     )
 
@@ -1837,9 +1897,16 @@ if __name__ == "__main__":
     parser.add_argument("--gemini-key", default="",
                         help="Gemini API key (overrides GEMINI_API_KEY env var)")
     parser.add_argument(
+        "--architecture",
+        choices=["parallel", "serial"],
+        default="parallel",
+        help="Frame-processing architecture: parallel (executor-optimized) or "
+             "serial (main-branch style, processes each frame in order).",
+    )
+    parser.add_argument(
     "--inference-interval", type=int, default=5, metavar="N",
-    help="Run YOLO inference every N frames (default 5). "
-         "All frames are still displayed and sent to the client.",)
+    help="Parallel architecture only: run YOLO inference every N frames "
+         "(default 5). All frames are still displayed and sent to the client.",)
 
     # ── Open-vocabulary detection (Grounding DINO + MobileSAM) ──
     ov_group = parser.add_mutually_exclusive_group()
@@ -1860,6 +1927,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.inference_interval < 1:
+        parser.error("--inference-interval must be >= 1")
+    if args.gdino_interval < 1:
+        parser.error("--gdino-interval must be >= 1")
+
     if args.device is None:
         import torch
         if torch.cuda.is_available():
@@ -1872,4 +1944,7 @@ if __name__ == "__main__":
 
     main(args.host, args.port, args.model, args.device, args.visualize,
          args.llm, args.gemini_key,
-         open_vocab=args.open_vocab, gdino_interval=args.gdino_interval)
+         architecture=args.architecture,
+         open_vocab=args.open_vocab,
+         gdino_interval=args.gdino_interval,
+         inference_interval=args.inference_interval)
