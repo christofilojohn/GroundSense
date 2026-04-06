@@ -23,6 +23,9 @@ Usage:
     # Replay at a different speed (default: use the recorded fps)
     python fake_client.py --recording my_walk.gsrecording --replay-fps 5
 
+    # Replay with open-vocabulary detection enabled alongside YOLO
+    python fake_client.py --recording my_walk.gsrecording --pipeline both --targets "wheelchair,wet floor sign"
+
 Wire format (must match Frame.from_bytes in server.py):
     [4B jpeg_size uint32LE][jpeg_bytes]
     [4B depth_size uint32LE][depth_float16_bytes]
@@ -38,6 +41,8 @@ Wire format (must match Frame.from_bytes in server.py):
       [28:32] flags    UInt32 LE = 0
     Followed by frameCount wire-format frame packets (same layout as above).
 """
+
+from __future__ import annotations
 
 import asyncio
 import argparse
@@ -400,11 +405,64 @@ def read_gsrecording(path: str):
         return fps, packets
 
 
+async def _send_set_targets(ws, targets_str: str) -> None:
+    """
+    Parse a comma-separated targets string and send a set_targets message.
+    Waits for the server's set_targets_ack.  No-op if targets_str is empty.
+    """
+    if not targets_str.strip():
+        return
+    objects = [t.strip() for t in targets_str.split(",") if t.strip()]
+    msg = json.dumps({"type": "set_targets", "objects": objects})
+    log.info(f"[OpenVocab] Sending set_targets: {objects}")
+    await ws.send(msg)
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        ack = json.loads(raw)
+        if ack.get("type") == "set_targets_ack":
+            if ack.get("ok"):
+                log.info(f"[OpenVocab] Targets confirmed by server: {ack.get('targets')}")
+            else:
+                log.warning(f"[OpenVocab] Server rejected targets: {ack.get('error')}")
+        else:
+            log.warning(f"[OpenVocab] Unexpected response to set_targets: {raw[:120]}")
+    except asyncio.TimeoutError:
+        log.warning("[OpenVocab] No ack received within 5 s — continuing anyway")
+
+
+async def _send_set_pipeline(ws, pipeline_mode: str) -> None:
+    """
+    Switch the server pipeline mode before streaming starts.
+    No-op when pipeline_mode is "keep".
+    """
+    mode = pipeline_mode.strip().lower()
+    if mode == "keep":
+        return
+
+    msg = json.dumps({"type": "set_pipeline", "mode": mode})
+    log.info(f"[Pipeline] Requesting mode: {mode}")
+    await ws.send(msg)
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        ack = json.loads(raw)
+        if ack.get("type") == "set_pipeline_ack":
+            if ack.get("ok"):
+                log.info(f"[Pipeline] Server mode confirmed: {ack.get('mode')}")
+            else:
+                log.warning(f"[Pipeline] Server rejected mode '{mode}': {ack.get('error')}")
+        else:
+            log.warning(f"[Pipeline] Unexpected response to set_pipeline: {raw[:120]}")
+    except asyncio.TimeoutError:
+        log.warning("[Pipeline] No ack received within 5 s — continuing anyway")
+
+
 async def stream_gsrecording(
     server: str,
     recording_path: str,
     fps_override: float | None = None,
     query: str = "",
+    targets: str = "",
+    pipeline: str = "keep",
 ):
     """Replay a .gsrecording file to the GroundSense server."""
     fps, packets = read_gsrecording(recording_path)
@@ -415,6 +473,9 @@ async def stream_gsrecording(
 
     log.info(f"Connecting to {server} …")
     async with websockets.connect(server, max_size=10 * 1024 * 1024) as ws:
+        await _send_set_pipeline(ws, pipeline)
+        # Activate open-vocab targets before the first frame
+        await _send_set_targets(ws, targets)
         log.info(f"Connected. Replaying {len(packets)} frames at {fps:.1f} fps")
 
         last_scene = None
@@ -472,6 +533,8 @@ async def main_async(args):
             recording_path=args.recording,
             fps_override=args.replay_fps if args.replay_fps > 0 else None,
             query=args.query,
+            targets=args.targets,
+            pipeline=args.pipeline,
         )
         return
 
@@ -496,6 +559,9 @@ async def main_async(args):
         async with websockets.connect(
             args.server, max_size=10 * 1024 * 1024
         ) as ws:
+            await _send_set_pipeline(ws, args.pipeline)
+            # Activate open-vocab targets before the first frame
+            await _send_set_targets(ws, args.targets)
             log.info(
                 f"Connected. Streaming frames {args.start}–{end - 1} "
                 f"at {args.fps:.1f} fps"
@@ -649,6 +715,29 @@ def main():
         "--query",
         default="",
         help="Voice query to send after streaming finishes",
+    )
+    parser.add_argument(
+        "--targets",
+        default="",
+        metavar="OBJ1,OBJ2,...",
+        help=(
+            "Comma-separated open-vocabulary objects to detect via Grounding DINO "
+            "(e.g. --targets 'wheelchair,service dog,wet floor sign'). "
+            "Sent to the server before streaming starts. "
+            "Requires --open-vocab on the server (enabled by default). "
+            "Leave empty for YOLO-only mode."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=["keep", "yolo", "gdino", "both"],
+        default="keep",
+        help=(
+            "Detection pipeline to request from the server before streaming. "
+            "'keep' leaves the current server mode unchanged (default). "
+            "'yolo' = YOLO-only, 'gdino' = open-vocab only, "
+            "'both' = YOLO + open-vocab."
+        ),
     )
 
     args = parser.parse_args()

@@ -24,6 +24,22 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lastSpokenText: String = ""
     @Published var transcribedQuery: String = ""
 
+    // MARK: - Scene objects (from server scene_update)
+    /// Last detected objects, used to draw bounding-box overlay on the camera feed.
+    @Published var sceneObjects: [SceneObject] = []
+
+    // MARK: - Audio alerts mute
+    /// When true the spoken obstacle warnings are suppressed; visual banner still shows.
+    @Published var alertsMuted: Bool = false
+
+    // MARK: - Detection pipeline mode
+    /// Active server-side pipeline.  Mirrors the server's _pipeline_mode.
+    /// "yolo" | "gdino" | "both"
+    @Published var pipelineMode: String = "yolo"
+    /// Comma-separated open-vocabulary targets, e.g. "wheelchair, service dog".
+    /// Sent to the server via set_targets when non-empty and mode != "yolo".
+    @Published var detectionTargets: String = ""
+
     // MARK: - Recording (owned here so ContentView can observe it)
     let recordingManager = RecordingManager()
 
@@ -144,6 +160,30 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         isStreaming = true
         statusMessage = "Connected to \(url.host ?? "server")"
         listenForMessages()
+
+        // On (re-)connect: if the user had a non-default mode or targets configured,
+        // send them once after the WebSocket handshake settles.
+        // Guard: only send if actually non-default, and send mode+targets as a single
+        // coordinated pair so the server never sees them out of order.
+        let savedMode    = pipelineMode
+        let savedTargets = detectionTargets
+        guard savedMode != "yolo" || !savedTargets.isEmpty else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.isStreaming else { return }
+            // Send mode first, then targets — setPipelineMode would re-send targets
+            // internally, so call the lower-level sender directly to avoid doubling up.
+            if savedMode != "yolo" {
+                if let data = try? JSONSerialization.data(withJSONObject: [
+                    "type": "set_pipeline", "mode": savedMode
+                ]), let text = String(data: data, encoding: .utf8) {
+                    self.sendTextMessage(text)
+                }
+            }
+            if !savedTargets.isEmpty {
+                self.setDetectionTargets(savedTargets)
+            }
+        }
     }
 
     func disconnectWebSocket() {
@@ -177,10 +217,38 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
             let msgType = json["type"] as? String
 
+            // ── Scene objects → bounding box overlay ─────────────────
+            if msgType == "scene_update",
+               let scene = json["scene"] as? [String: Any],
+               let rawObjs = scene["objects"] as? [[String: Any]] {
+                let parsed: [SceneObject] = rawObjs.compactMap { obj in
+                    guard let bbox = obj["bbox"] as? [Double], bbox.count == 4
+                    else { return nil }
+                    return SceneObject(
+                        className:  obj["class"]       as? String ?? "?",
+                        distanceM:  obj["distance_m"]  as? Double ?? 0,
+                        direction:  obj["direction"]   as? String ?? "",
+                        confidence: obj["confidence"]  as? Double ?? 0,
+                        source:     obj["source"]      as? String ?? "yolo",
+                        // Stored in landscape-normalized coords (0–1).
+                        // The overlay view applies the 90° CW rotation to portrait.
+                        bboxX1: bbox[0], bboxY1: bbox[1],
+                        bboxX2: bbox[2], bboxY2: bbox[3]
+                    )
+                }
+                DispatchQueue.main.async { self.sceneObjects = parsed }
+            }
+
+            // ── Warnings & query responses ────────────────────────────
             if let warning = json["warning"] as? String {
-                speakWithCooldown(warning)
+                // Visual banner always updates; speech is suppressed when muted.
+                DispatchQueue.main.async { self.lastSpokenText = warning }
+                if !alertsMuted {
+                    speakWithCooldown(warning)
+                }
             }
             if msgType == "query_response", let answer = json["answer"] as? String {
+                // Query responses always speak (they're user-initiated).
                 speakForced(answer)
             }
 
@@ -319,6 +387,60 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         let socket = webSocket
         Task { try? await socket?.send(.string(jsonString)) }
         print("Sent voice query: \(query)")
+    }
+
+    // MARK: - Pipeline / Target control
+
+    /// Send any JSON string to the server (fire-and-forget).
+    /// Silently no-ops if the WebSocket is not connected.
+    func sendTextMessage(_ text: String) {
+        guard let socket = webSocket else { return }
+        Task { try? await socket.send(.string(text)) }
+    }
+
+    /// Switch the server-side detection pipeline.
+    /// - "yolo"  — YOLO only (fast, COCO classes)
+    /// - "gdino" — Grounding DINO only (open-vocabulary targets, no YOLO)
+    /// - "both"  — YOLO always + GDINO for user targets (highest coverage)
+    func setPipelineMode(_ mode: String) {
+        let previous = pipelineMode
+        pipelineMode = mode
+        guard isStreaming else { return }
+
+        // Only send set_pipeline when the mode actually changes.
+        if mode != previous {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "type": "set_pipeline",
+                "mode": mode,
+            ]), let text = String(data: data, encoding: .utf8) else { return }
+            sendTextMessage(text)
+        }
+
+        // Send targets when switching INTO a GDINO-capable mode for the first time,
+        // but not if the mode didn't change (avoids redundant cache resets on server).
+        if mode != "yolo" && !detectionTargets.isEmpty && mode != previous {
+            setDetectionTargets(detectionTargets)
+        }
+    }
+
+    /// Push the current detection targets to the server.
+    /// Parses the comma-separated `targetsString`, trims whitespace,
+    /// and sends {"type":"set_targets","objects":[…]}.
+    func setDetectionTargets(_ targetsString: String) {
+        detectionTargets = targetsString
+        guard isStreaming else { return }
+
+        let objects = targetsString
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "type": "set_targets",
+            "objects": objects,
+        ] as [String: Any]), let text = String(data: data, encoding: .utf8) else { return }
+        sendTextMessage(text)
+        print("[Pipeline] targets → \(objects)")
     }
 
     // MARK: - ARSessionDelegate — Frame Processing
@@ -516,6 +638,32 @@ private extension Data {
     mutating func appendUInt32LE(_ value: UInt32) {
         var v = value.littleEndian
         append(Data(bytes: &v, count: 4))
+    }
+}
+
+// MARK: - Scene Object (for bounding-box overlay)
+
+/// A single detected object received from the server's scene_update response.
+/// `bbox*` fields are in **landscape-normalised** coordinates (0–1), matching
+/// the frame the server processed.  The overlay view converts them to portrait.
+struct SceneObject: Identifiable {
+    let id = UUID()
+    let className: String
+    let distanceM: Double
+    let direction: String
+    let confidence: Double
+    let source: String          // "yolo" | "gdino"
+    let bboxX1: Double          // landscape left   (0–1)
+    let bboxY1: Double          // landscape top    (0–1)
+    let bboxX2: Double          // landscape right  (0–1)
+    let bboxY2: Double          // landscape bottom (0–1)
+
+    /// Box colour: GDINO detections are purple; YOLO uses distance-based traffic-light.
+    var overlayColor: UIColor {
+        if source == "gdino" { return UIColor(red: 0.7, green: 0.2, blue: 1.0, alpha: 1) }
+        if distanceM < 1.0   { return .systemRed }
+        if distanceM < 2.0   { return .systemOrange }
+        return .systemGreen
     }
 }
 

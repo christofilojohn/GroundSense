@@ -1,0 +1,34 @@
+{
+  "model": "yolo26s-seg.pt",
+  "device": "mps",
+  "n_frames": 60,
+  "throughput_fps": 9.2,
+  "detection_rate_pct": 30.0,
+  "mean_objects_per_frame": 0.33,
+  "median_objects_per_frame": 0.0,
+  "top_classes": {
+    "refrigerator": 5,
+    "chair": 5,
+    "clock": 2,
+    "toilet": 2,
+    "microwave": 1,
+    "potted plant": 1,
+    "tv": 1,
+    "couch": 1,
+    "bed": 1,
+    "handbag": 1
+  },
+  "direction_counts": {
+    "right": 14,
+    "left": 2,
+    "center": 4
+  },
+  "free_direction_counts": {
+    "center": 19,
+    "left": 36,
+    "right": 5
+  },
+  "warning_rate_pct": 16.7,
+  "depth_mae_bbox_centre": 0.1,
+  "depth_mae_bbox_mean": 0.108
+}
