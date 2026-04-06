@@ -27,6 +27,8 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - Scene objects (from server scene_update)
     /// Last detected objects, used to draw bounding-box overlay on the camera feed.
     @Published var sceneObjects: [SceneObject] = []
+    /// Latest LiDAR-only path recommendation rendered as arrow guidance.
+    @Published var pathGuidance: PathGuidance? = nil
 
     // MARK: - Audio alerts mute
     /// When true the spoken obstacle warnings are suppressed; visual banner still shows.
@@ -146,6 +148,8 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         session.pause()
         isRunning = false
         disconnectWebSocket()
+        sceneObjects = []
+        pathGuidance = nil
         fpsTimer?.invalidate()
         stopListening()
     }
@@ -190,6 +194,10 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         isStreaming = false
+        DispatchQueue.main.async {
+            self.sceneObjects = []
+            self.pathGuidance = nil
+        }
     }
 
     private func listenForMessages() {
@@ -236,7 +244,33 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                         bboxX2: bbox[2], bboxY2: bbox[3]
                     )
                 }
-                DispatchQueue.main.async { self.sceneObjects = parsed }
+                let parsedPath: PathGuidance? = {
+                    guard let rawPath = scene["path"] as? [String: Any] else { return nil }
+                    let rawArrows = rawPath["arrows"] as? [[String: Any]] ?? []
+                    let arrows = rawArrows.map { arrow in
+                        PathArrowGuidance(
+                            direction: arrow["direction"] as? String ?? "center",
+                            centerX: arrow["center_x"] as? Double ?? 0.5,
+                            angleDeg: arrow["angle_deg"] as? Double ?? 0,
+                            clearanceM: arrow["clearance_m"] as? Double ?? 0,
+                            widthM: arrow["width_m"] as? Double ?? 0,
+                            confidence: arrow["confidence"] as? Double ?? 0
+                        )
+                    }
+                    return PathGuidance(
+                        direction: rawPath["direction"] as? String ?? "center",
+                        centerX: rawPath["center_x"] as? Double ?? 0.5,
+                        angleDeg: rawPath["angle_deg"] as? Double ?? 0,
+                        clearanceM: rawPath["clearance_m"] as? Double ?? 0,
+                        widthM: rawPath["width_m"] as? Double ?? 0,
+                        confidence: rawPath["confidence"] as? Double ?? 0,
+                        arrows: arrows
+                    )
+                }()
+                DispatchQueue.main.async {
+                    self.sceneObjects = parsed
+                    self.pathGuidance = parsedPath
+                }
             }
 
             // ── Warnings & query responses ────────────────────────────
@@ -665,6 +699,26 @@ struct SceneObject: Identifiable {
         if distanceM < 2.0   { return .systemOrange }
         return .systemGreen
     }
+}
+
+struct PathArrowGuidance: Identifiable {
+    let id = UUID()
+    let direction: String
+    let centerX: Double
+    let angleDeg: Double
+    let clearanceM: Double
+    let widthM: Double
+    let confidence: Double
+}
+
+struct PathGuidance {
+    let direction: String
+    let centerX: Double
+    let angleDeg: Double
+    let clearanceM: Double
+    let widthM: Double
+    let confidence: Double
+    let arrows: [PathArrowGuidance]
 }
 
 struct FrameMetadata: Codable {

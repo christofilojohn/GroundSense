@@ -23,6 +23,9 @@ Usage:
     # Replay at a different speed (default: use the recorded fps)
     python fake_client.py --recording my_walk.gsrecording --replay-fps 5
 
+    # Replay at 0.5× speed (half the recorded fps — useful for slow hardware)
+    python fake_client.py --recording my_walk.gsrecording --speed 0.5
+
     # Replay with open-vocabulary detection enabled alongside YOLO
     python fake_client.py --recording my_walk.gsrecording --pipeline both --targets "wheelchair,wet floor sign"
 
@@ -185,7 +188,7 @@ _last_source = ""
 
 def render_frame(bgr: np.ndarray, scene: dict | None = None):
     """
-    Show the RGB image with YOLO bounding boxes only.
+    Show the RGB image with detection boxes and free-space path arrows.
     Press 'q' to quit. Returns False when the user presses 'q'.
     """
     canvas = bgr.copy()
@@ -205,6 +208,29 @@ def render_frame(bgr: np.ndarray, scene: dict | None = None):
                 (50, 200, 50)
             )
             cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 2)
+
+        path = scene.get("path") or {}
+        arrows = path.get("arrows") or []
+        if arrows:
+            origin = (w // 2, h - 40)
+            for idx, arrow in enumerate(reversed(arrows)):
+                center_x = float(arrow.get("center_x", 0.5))
+                tip = (int(np.clip(center_x, 0.08, 0.92) * w), int(h * (0.62 - idx * 0.05)))
+                confidence = float(arrow.get("confidence", 0.0))
+                width_m = float(arrow.get("width_m", 0.0))
+                colour = (0, 140, 255) if confidence < 0.18 or width_m < 0.64 else (80, 255, 120)
+                thickness = 4 if idx == len(arrows) - 1 else 2
+                cv2.arrowedLine(canvas, origin, tip, colour, thickness, tipLength=0.22)
+
+            primary = arrows[0]
+            label = (
+                f"path {primary.get('direction', 'center')}  "
+                f"{primary.get('clearance_m', 0):.1f}m clear  "
+                f"{primary.get('width_m', 0):.1f}m wide"
+            )
+            cv2.rectangle(canvas, (10, h - 74), (min(w - 10, 330), h - 44), (0, 0, 0), -1)
+            cv2.putText(canvas, label, (16, h - 53),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.imshow("GroundSense", canvas)
     cv2.waitKey(1)
@@ -266,6 +292,7 @@ async def stream(
                     objs  = scene["objects"]
                     free  = scene["free_direction"]
                     close = scene["closest_obstacle_m"]
+                    path  = scene.get("path", {})
 
                     obj_str = "  ".join(
                         f"{o['class']} {o['distance_m']}m {o['direction']}"
@@ -273,7 +300,9 @@ async def stream(
                     ) or "(none)"
                     log.info(
                         f"  [{i:4d}] {len(objs)} obj | free={free} | "
-                        f"closest={close:.1f}m | {obj_str}"
+                        f"closest={close:.1f}m | "
+                        f"path={path.get('clearance_m', 0):.1f}m/{path.get('width_m', 0):.1f}m | "
+                        f"{obj_str}"
                     )
                     if "warning" in resp:
                         log.warning(f"  ⚠  {resp['warning']}")
@@ -460,15 +489,20 @@ async def stream_gsrecording(
     server: str,
     recording_path: str,
     fps_override: float | None = None,
+    speed: float = 1.0,
     query: str = "",
     targets: str = "",
     pipeline: str = "keep",
 ):
     """Replay a .gsrecording file to the GroundSense server."""
     fps, packets = read_gsrecording(recording_path)
+    # Apply speed multiplier first, then fps_override (if given)
+    fps *= speed
     if fps_override:
         fps = fps_override
         log.info(f"FPS overridden to {fps:.1f}")
+    elif speed != 1.0:
+        log.info(f"Speed multiplier {speed}× → playback at {fps:.2f} fps")
     interval = 1.0 / fps
 
     log.info(f"Connecting to {server} …")
@@ -494,13 +528,16 @@ async def stream_gsrecording(
                     objs  = scene["objects"]
                     free  = scene["free_direction"]
                     close = scene["closest_obstacle_m"]
+                    path  = scene.get("path", {})
                     obj_str = "  ".join(
                         f"{o['class']} {o['distance_m']}m {o['direction']}"
                         for o in objs[:4]
                     ) or "(none)"
                     log.info(
                         f"  [{i:4d}/{len(packets)}] {len(objs)} obj | "
-                        f"free={free} | closest={close:.1f}m | {obj_str}"
+                        f"free={free} | closest={close:.1f}m | "
+                        f"path={path.get('clearance_m', 0):.1f}m/{path.get('width_m', 0):.1f}m | "
+                        f"{obj_str}"
                     )
                     if "warning" in resp:
                         log.warning(f"  ⚠  {resp['warning']}")
@@ -532,6 +569,7 @@ async def main_async(args):
             server=args.server,
             recording_path=args.recording,
             fps_override=args.replay_fps if args.replay_fps > 0 else None,
+            speed=args.speed,
             query=args.query,
             targets=args.targets,
             pipeline=args.pipeline,
@@ -590,13 +628,16 @@ async def main_async(args):
                         objs  = scene["objects"]
                         free  = scene["free_direction"]
                         close = scene["closest_obstacle_m"]
+                        path  = scene.get("path", {})
                         obj_str = "  ".join(
                             f"{o['class']} {o['distance_m']}m {o['direction']}"
                             for o in objs[:4]
                         ) or "(none)"
                         log.info(
                             f"  [{i:4d}] {len(objs)} obj | free={free} | "
-                            f"closest={close:.1f}m | {obj_str}"
+                            f"closest={close:.1f}m | "
+                            f"path={path.get('clearance_m', 0):.1f}m/{path.get('width_m', 0):.1f}m | "
+                            f"{obj_str}"
                         )
                         if "warning" in resp:
                             log.warning(f"  ⚠  {resp['warning']}")
@@ -666,6 +707,17 @@ def main():
         help=(
             "Override playback speed for --recording mode. "
             "0 = use the fps stored in the recording (default)."
+        ),
+    )
+    rec_group.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        metavar="MULT",
+        help=(
+            "Playback speed multiplier for --recording mode (default 1.0 = real-time). "
+            "0.5 = half speed, 2.0 = double speed. "
+            "Applied before --replay-fps; ignored if --replay-fps is set."
         ),
     )
 

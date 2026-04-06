@@ -25,6 +25,12 @@ struct ContentView: View {
                     .allowsHitTesting(false)
             }
 
+            if captureManager.isStreaming, let guidance = captureManager.pathGuidance {
+                PathGuidanceOverlay(guidance: guidance)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+
             // Overlay UI
             VStack(spacing: 0) {
 
@@ -413,6 +419,70 @@ private struct BottomControls: View {
 }
 
 // MARK: - Detection Bounding-Box Overlay
+
+private struct PathGuidanceOverlay: View {
+    let guidance: PathGuidance
+
+    private func arrowColor(confidence: Double, widthM: Double) -> Color {
+        if confidence < 0.18 || widthM < 0.64 {
+            return .orange
+        }
+        return .green
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            Canvas { ctx, size in
+                let origin = CGPoint(x: size.width / 2, y: size.height - 120)
+
+                for (index, arrow) in guidance.arrows.enumerated() {
+                    let isPrimary = index == 0
+                    let x = CGFloat(min(max(arrow.centerX, 0.08), 0.92)) * size.width
+                    let y = size.height * (isPrimary ? 0.60 : (0.66 + CGFloat(index - 1) * 0.05))
+                    let tip = CGPoint(x: x, y: y)
+
+                    var path = Path()
+                    path.move(to: origin)
+                    path.addLine(to: tip)
+                    ctx.stroke(
+                        path,
+                        with: .color(arrowColor(confidence: arrow.confidence, widthM: arrow.widthM).opacity(isPrimary ? 0.95 : 0.5)),
+                        style: StrokeStyle(lineWidth: isPrimary ? 7 : 3, lineCap: .round, lineJoin: .round)
+                    )
+
+                    let angle = atan2(tip.y - origin.y, tip.x - origin.x)
+                    let headLength: CGFloat = isPrimary ? 20 : 12
+                    let headSpread: CGFloat = .pi / 7
+                    var head = Path()
+                    head.move(to: tip)
+                    head.addLine(to: CGPoint(
+                        x: tip.x - cos(angle - headSpread) * headLength,
+                        y: tip.y - sin(angle - headSpread) * headLength
+                    ))
+                    head.move(to: tip)
+                    head.addLine(to: CGPoint(
+                        x: tip.x - cos(angle + headSpread) * headLength,
+                        y: tip.y - sin(angle + headSpread) * headLength
+                    ))
+                    ctx.stroke(
+                        head,
+                        with: .color(arrowColor(confidence: arrow.confidence, widthM: arrow.widthM).opacity(isPrimary ? 0.95 : 0.5)),
+                        style: StrokeStyle(lineWidth: isPrimary ? 7 : 3, lineCap: .round, lineJoin: .round)
+                    )
+                }
+
+                let pillRect = CGRect(x: 18, y: size.height - 176, width: min(size.width - 36, 250), height: 44)
+                ctx.fill(Path(roundedRect: pillRect, cornerRadius: 14), with: .color(.black.opacity(0.55)))
+                let label = Text(
+                    "\(guidance.direction.capitalized) path  \(String(format: "%.1f", guidance.clearanceM))m clear  \(String(format: "%.1f", guidance.widthM))m wide"
+                )
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundColor(.white)
+                ctx.draw(label, at: CGPoint(x: pillRect.minX + 12, y: pillRect.minY + 14), anchor: .topLeading)
+            }
+        }
+    }
+}
 
 /// Draws server-detected bounding boxes over the live camera feed.
 ///
