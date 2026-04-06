@@ -57,14 +57,14 @@ class ServerStartupError(RuntimeError):
     """Raised when the WebSocket server cannot start cleanly."""
 
 
-def _wrap_server_startup_error(host: str, port: int, exc: OSError) -> Exception:
-    """Convert low-level bind errors into actionable startup messages."""
-    if exc.errno == errno.EADDRINUSE:
-        return ServerStartupError(
-            f"Port {port} is already in use on {host}. "
-            f"Stop the existing listener or rerun with --port <free-port>."
-        )
-    return exc
+    def _wrap_server_startup_error(host: str, port: int, exc: OSError) -> Exception:
+        """Convert low-level bind errors into actionable startup messages."""
+        if exc.errno == errno.EADDRINUSE:
+            return ServerStartupError(
+                f"Port {port} is already in use on {host}. "
+                f"Stop the existing listener or rerun with --port <free-port>."
+            )
+        return exc
 
 
 # ── Frame unpacking ──────────────────────────────────────────────────
@@ -1115,7 +1115,7 @@ class GroundSenseServer:
 
     def __init__(self, model_name: str = "yolo26s-seg.pt", device: str = "cpu",
                  visualize: bool = False, llm: str = "gemini", gemini_key: str = "",
-                 open_vocab: bool = True, gdino_interval: int = 5):
+                 open_vocab: bool = True, gdino_interval: int = 5,inference_interval: int = 5):
         self.pipeline     = SegmentationPipeline(model_name=model_name, device=device)
         self.open_vocab   = OpenVocabPipeline(device=device, interval=gdino_interval)
         self.response_gen = ResponseGenerator(llm=llm, gemini_key=gemini_key)
@@ -1132,6 +1132,7 @@ class GroundSenseServer:
         self.visualizer = Visualizer() if visualize else None
         # Persistent scene state — updated every frame, read by query handler
         self.last_scene: Optional[SceneState] = None
+        self.inference_interval = inference_interval
 
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
@@ -1156,6 +1157,85 @@ class GroundSenseServer:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client disconnected: {client_addr}")
 
+    # async def _process_frame(self, websocket, data: bytes):
+    #     """Process a binary frame packet."""
+    #     self.frame_count += 1
+
+    #     try:
+    #         frame = Frame.from_bytes(data)
+    #     except Exception as e:
+    #         logger.error(f"Frame decode error: {e}")
+    #         return
+
+    #     loop = asyncio.get_event_loop()
+    #     mode = self._pipeline_mode   # snapshot — may change between awaits
+
+    #     # ── Primary pipeline: YOLO ────────────────────────────────────
+    #     # Runs synchronous inference in a thread so the event loop stays free.
+    #     # Skipped in "gdino" mode to reduce CPU/GPU load.
+    #     if mode in ("yolo", "both"):
+    #         scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
+    #     else:
+    #         # GDINO-only: build a blank scene and still estimate free direction
+    #         # from the raw LiDAR depth map (no bilateral filter, but accurate enough).
+    #         scene = SceneState(timestamp=frame.timestamp)
+    #         scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+    #             frame.depth, []
+    #         )
+
+    #     # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
+    #     # GDINO inference takes ~500–2000 ms on CPU, far too slow to await
+    #     # on every frame.  Instead:
+    #     #   • Merge the *cached* result from the last completed inference
+    #     #     into this frame's scene immediately (always fast — a list copy).
+    #     #   • Every `interval` frames, if no inference is already running,
+    #     #     fire a background asyncio Task that calls the executor and
+    #     #     updates the cache when done.  The current frame never waits.
+    #     if (self._open_vocab_enabled
+    #             and mode in ("gdino", "both")
+    #             and self.open_vocab.target_objects):
+
+    #         # 1. Use last known result now (stale by at most interval frames)
+    #         ov_objects = list(self.open_vocab._cached)
+    #         if ov_objects:
+    #             scene.objects.extend(ov_objects)
+    #             scene.objects.sort(key=lambda o: o.distance_m)
+    #             scene.closest_obstacle_m = scene.objects[0].distance_m
+
+    #         # 2. Kick off fresh inference in the background if it's due
+    #         self.open_vocab._frame_count += 1
+    #         if (self.open_vocab._frame_count % self.open_vocab.interval == 0
+    #                 and not self._gdino_running
+    #                 and self.open_vocab._ensure_loaded()):
+    #             self._gdino_running = True
+    #             asyncio.create_task(self._run_gdino_background(frame))
+
+    #     # Persist scene for query handler
+    #     self.last_scene = scene
+
+    #     # Generate obstacle warning (with cooldown)
+    #     now = time.time()
+    #     response = {"type": "scene_update", "scene": scene.to_dict()}
+
+    #     if now - self.last_warning_time > self.warning_cooldown:
+    #         warning = self.response_gen.generate_obstacle_warning(scene)
+    #         if warning:
+    #             response["warning"] = warning
+    #             self.last_warning_time = now
+
+    #     await websocket.send(json.dumps(response))
+
+    #     # Update live window (if --visualize was passed)
+    #     if self.visualizer is not None:
+    #         self.visualizer.update(frame, scene)
+
+    #     if self.frame_count % 30 == 0:
+    #         logger.info(
+    #             f"Processed {self.frame_count} frames | "
+    #             f"Objects: {len(scene.objects)} | "
+    #             f"Closest: {scene.closest_obstacle_m:.1f}m | "
+    #             f"Free: {scene.free_direction}"
+    #         )
     async def _process_frame(self, websocket, data: bytes):
         """Process a binary frame packet."""
         self.frame_count += 1
@@ -1167,52 +1247,45 @@ class GroundSenseServer:
             return
 
         loop = asyncio.get_event_loop()
-        mode = self._pipeline_mode   # snapshot — may change between awaits
+        mode = self._pipeline_mode
 
-        # ── Primary pipeline: YOLO ────────────────────────────────────
-        # Runs synchronous inference in a thread so the event loop stays free.
-        # Skipped in "gdino" mode to reduce CPU/GPU load.
-        if mode in ("yolo", "both"):
-            scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
+        # ── Frame skipping: run inference every 5th frame, reuse cached scene otherwise ──
+        run_inference = (self.frame_count % self.inference_interval == 0) or self.last_scene is None
+
+        if run_inference:
+            if mode in ("yolo", "both"):
+                scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
+            else:
+                scene = SceneState(timestamp=frame.timestamp)
+                scene.free_direction = self.pipeline._estimate_free_direction_lidar(
+                    frame.depth, []
+                )
+
+            # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
+            if (self._open_vocab_enabled
+                    and mode in ("gdino", "both")
+                    and self.open_vocab.target_objects):
+                ov_objects = list(self.open_vocab._cached)
+                if ov_objects:
+                    scene.objects.extend(ov_objects)
+                    scene.objects.sort(key=lambda o: o.distance_m)
+                    scene.closest_obstacle_m = scene.objects[0].distance_m
+
+                self.open_vocab._frame_count += 1
+                if (self.open_vocab._frame_count % self.open_vocab.interval == 0
+                        and not self._gdino_running
+                        and self.open_vocab._ensure_loaded()):
+                    self._gdino_running = True
+                    asyncio.create_task(self._run_gdino_background(frame))
+
+            self.last_scene = scene
         else:
-            # GDINO-only: build a blank scene and still estimate free direction
-            # from the raw LiDAR depth map (no bilateral filter, but accurate enough).
-            scene = SceneState(timestamp=frame.timestamp)
-            scene.free_direction = self.pipeline._estimate_free_direction_lidar(
-                frame.depth, []
-            )
+            # Skipped frame — reuse the last scene but update its timestamp
+            scene = self.last_scene
+            scene.timestamp = frame.timestamp
 
-        # ── Secondary pipeline: Grounding DINO (non-blocking) ────────
-        # GDINO inference takes ~500–2000 ms on CPU, far too slow to await
-        # on every frame.  Instead:
-        #   • Merge the *cached* result from the last completed inference
-        #     into this frame's scene immediately (always fast — a list copy).
-        #   • Every `interval` frames, if no inference is already running,
-        #     fire a background asyncio Task that calls the executor and
-        #     updates the cache when done.  The current frame never waits.
-        if (self._open_vocab_enabled
-                and mode in ("gdino", "both")
-                and self.open_vocab.target_objects):
+        # ── Everything below runs for ALL frames (display + warnings + send) ──
 
-            # 1. Use last known result now (stale by at most interval frames)
-            ov_objects = list(self.open_vocab._cached)
-            if ov_objects:
-                scene.objects.extend(ov_objects)
-                scene.objects.sort(key=lambda o: o.distance_m)
-                scene.closest_obstacle_m = scene.objects[0].distance_m
-
-            # 2. Kick off fresh inference in the background if it's due
-            self.open_vocab._frame_count += 1
-            if (self.open_vocab._frame_count % self.open_vocab.interval == 0
-                    and not self._gdino_running
-                    and self.open_vocab._ensure_loaded()):
-                self._gdino_running = True
-                asyncio.create_task(self._run_gdino_background(frame))
-
-        # Persist scene for query handler
-        self.last_scene = scene
-
-        # Generate obstacle warning (with cooldown)
         now = time.time()
         response = {"type": "scene_update", "scene": scene.to_dict()}
 
@@ -1224,7 +1297,7 @@ class GroundSenseServer:
 
         await websocket.send(json.dumps(response))
 
-        # Update live window (if --visualize was passed)
+        # Visualizer gets EVERY frame (smooth display) with the current scene
         if self.visualizer is not None:
             self.visualizer.update(frame, scene)
 
