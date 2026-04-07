@@ -66,10 +66,13 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // MARK: - TTS
     private let speechSynthesizer = AVSpeechSynthesizer()
-    /// Last time a warning was spoken (obstacle-avoidance cooldown).
-    private var lastSpeakTime: CFTimeInterval = 0
-    /// Don't repeat obstacle warnings more than once per this interval (seconds).
-    private let speakCooldown: CFTimeInterval = 2.5
+    /// Timestamp when the last warning utterance finished playing.
+    private var lastSpeechEndTime: CFTimeInterval = 0
+    /// Minimum gap between successive obstacle warnings (seconds), measured from
+    /// the *end* of the previous utterance so long alerts are fully audible.
+    private let speakCooldown: CFTimeInterval = 5.0
+    /// Last warning text that was spoken — suppresses exact duplicates.
+    private var lastSpokenWarning: String = ""
 
     // MARK: - STT
     private var speechRecognizer: SFSpeechRecognizer?
@@ -81,6 +84,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         self.frameInterval = 1.0 / Double(targetFPS)
         super.init()
         session.delegate = self
+        speechSynthesizer.delegate = self
         speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     }
 
@@ -262,9 +266,17 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - TTS
 
     func speakWithCooldown(_ text: String) {
+        // Don't interrupt speech already in progress — let the user hear it fully.
+        guard !speechSynthesizer.isSpeaking else { return }
+
+        // Enforce cooldown measured from *end* of the previous utterance.
         let now = CACurrentMediaTime()
-        guard now - lastSpeakTime >= speakCooldown else { return }
-        lastSpeakTime = now
+        guard now - lastSpeechEndTime >= speakCooldown else { return }
+
+        // Suppress exact duplicate warnings (e.g. same obstacle at same distance).
+        guard text != lastSpokenWarning else { return }
+
+        lastSpokenWarning = text
         speakForced(text)
     }
 
@@ -664,6 +676,20 @@ struct SceneObject: Identifiable {
         if distanceM < 1.0   { return .systemRed }
         if distanceM < 2.0   { return .systemOrange }
         return .systemGreen
+    }
+}
+
+// MARK: - AVSpeechSynthesizerDelegate
+
+extension ARCaptureManager: AVSpeechSynthesizerDelegate {
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                           didFinish utterance: AVSpeechUtterance) {
+        lastSpeechEndTime = CACurrentMediaTime()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                           didCancel utterance: AVSpeechUtterance) {
+        lastSpeechEndTime = CACurrentMediaTime()
     }
 }
 

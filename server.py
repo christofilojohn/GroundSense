@@ -230,12 +230,14 @@ class SegmentationPipeline:
 
                 # Bounding box (xyxy normalized)
                 x1, y1, x2, y2 = box.xyxyn[0].tolist()
-                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
 
-                # Direction from horizontal position
-                if center_x < 0.33:
+                # Direction from landscape y-axis → portrait x-axis (inverted).
+                # Large landscape y (bottom of frame) = left in the user's portrait view;
+                # small landscape y (top of frame) = right in portrait.
+                if center_y > 0.66:
                     direction = "left"
-                elif center_x > 0.66:
+                elif center_y < 0.33:
                     direction = "right"
                 else:
                     direction = "center"
@@ -309,15 +311,21 @@ class SegmentationPipeline:
         """
         if depth is not None:
             dh, dw = depth.shape
-            # Focus on the lower two-thirds of the frame — that's where obstacles
-            # the user would walk into are most likely to appear.
-            roi = depth[dh // 3 :, :]
+            # The depth map is in landscape orientation.  In the user's portrait
+            # view, landscape columns (x-axis) map to vertical and landscape rows
+            # (y-axis) map to horizontal (inverted).  Focus on the rightmost
+            # two-thirds of the landscape width — that corresponds to the lower
+            # portion of the portrait view where ground-level obstacles appear.
+            roi = depth[:, dw // 3 :]
 
-            third = dw // 3
+            # Divide along landscape height (rows / y-axis) for left-center-right
+            # in portrait.  Top rows (small y) = right in portrait;
+            # bottom rows (large y) = left in portrait.
+            third = dh // 3
             sectors = {
-                "left":   roi[:, :third],
-                "center": roi[:, third : 2 * third],
-                "right":  roi[:, 2 * third :],
+                "right":  roi[:third, :],
+                "center": roi[third : 2 * third, :],
+                "left":   roi[2 * third :, :],
             }
 
             clearances: dict[str, float] = {}
@@ -591,9 +599,10 @@ class OpenVocabPipeline:
             ny1 = float(y1p) / h
             nx2 = float(x2p) / w
             ny2 = float(y2p) / h
-            cx  = (nx1 + nx2) / 2
+            cy  = (ny1 + ny2) / 2
 
-            direction = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+            # Landscape y → portrait x (inverted): large cy = left, small cy = right
+            direction = "left" if cy > 0.66 else ("right" if cy < 0.33 else "center")
 
             # ── Depth estimation (mask → LiDAR sampling) ─────────────
             distance = float("inf")

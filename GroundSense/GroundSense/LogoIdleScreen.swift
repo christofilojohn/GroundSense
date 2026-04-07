@@ -44,6 +44,7 @@ struct LogoIdleScreen: View {
                     .font(.system(.subheadline, design: .rounded))
                     .foregroundColor(.white.opacity(0.45))
                     .opacity(subtitleOpacity)
+                    .offset(y: -18)
 
                 Spacer()
             }
