@@ -35,37 +35,43 @@ import cv2
 import h5py
 
 
-# ── Auto device ──────────────────────────────────────────────────────────────
+# Auto device
+
 
 def _auto_device() -> str:
     try:
         import torch
-        if torch.cuda.is_available():   return "cuda"
-        if torch.backends.mps.is_available(): return "mps"
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
     except ImportError:
         pass
     return "cpu"
 
 
-# ── NYU loader ───────────────────────────────────────────────────────────────
+# NYU loader
+
 
 def load_nyu(mat_path: str, count: int):
     print(f"Loading {mat_path} …")
     with h5py.File(mat_path, "r") as f:
-        images = np.array(f["images"])   # (N, 3, H, W) uint8
-        depths = np.array(f["depths"])   # (N, H, W) float32 metres
+        images = np.array(f["images"])  # (N, 3, H, W) uint8
+        depths = np.array(f["depths"])  # (N, H, W) float32 metres
     n = min(count, images.shape[0])
     print(f"  {n}/{images.shape[0]} frames")
     frames = []
     for i in range(n):
-        rgb   = np.transpose(images[i], (1, 2, 0))
-        rgb   = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        rgb = np.transpose(images[i], (1, 2, 0))
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         depth = depths[i].astype(np.float32)
         frames.append({"rgb": rgb, "depth": depth})
     return frames
 
 
-# ── Depth estimators (for comparison) ────────────────────────────────────────
+# Depth estimators (for comparison)
+
 
 def depth_at_bbox_centre(depth: np.ndarray, bbox_norm, rgb_shape) -> float:
     """GT depth at the centre pixel of the bounding box."""
@@ -86,7 +92,7 @@ def depth_mean_bbox(depth: np.ndarray, bbox_norm) -> float:
     x1, y1, x2, y2 = bbox_norm
     r0, r1 = int(y1 * dh), int(y2 * dh)
     c0, c1 = int(x1 * dw), int(x2 * dw)
-    region = depth[max(0,r0):max(0,r1)+1, max(0,c0):max(0,c1)+1]
+    region = depth[max(0, r0) : max(0, r1) + 1, max(0, c0) : max(0, c1) + 1]
     valid = region[(region > 0.1) & (region < 10)]
     return float(np.mean(valid)) if len(valid) > 0 else float("inf")
 
@@ -94,15 +100,14 @@ def depth_mean_bbox(depth: np.ndarray, bbox_norm) -> float:
 def depth_percentile_mask(depth: np.ndarray, mask_data) -> float:
     """10th-percentile GT depth within the segmentation mask (pipeline method)."""
     dh, dw = depth.shape
-    mask_resized = cv2.resize(
-        mask_data.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST
-    )
+    mask_resized = cv2.resize(mask_data.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST)
     vals = depth[mask_resized > 0.5]
     vals = vals[(vals > 0.1) & (vals < 10)]
     return float(np.percentile(vals, 10)) if len(vals) > 0 else float("inf")
 
 
-# ── Main evaluation ───────────────────────────────────────────────────────────
+# Main evaluation
+
 
 def run(args):
     device = args.device or _auto_device()
@@ -114,25 +119,25 @@ def run(args):
 
     frames = load_nyu(args.mat, args.frames)
 
-    # Import pipeline after device is known (lazy import avoids CUDA init on CPU runs)
+    # Lazy import so CUDA isn't initialised before the device is chosen
     from server import SegmentationPipeline, Frame, ResponseGenerator
 
     pipeline = SegmentationPipeline(model_name=args.model, device=device)
-    resp_gen = ResponseGenerator(llm="none")   # rule-based only — no API key needed
+    resp_gen = ResponseGenerator(llm="none")  # rule-based only — no API key needed
 
-    # ── Per-frame accumulators ────────────────────────────────────────────────
-    n_frames          = 0
+    # Per-frame accumulators
+    n_frames = 0
     n_frames_detected = 0
     objects_per_frame = []
-    class_counter     = Counter()
+    class_counter = Counter()
     direction_counter = Counter()
-    free_dir_counter  = Counter()
-    warning_frames    = 0
+    free_dir_counter = Counter()
+    warning_frames = 0
 
     # Depth accuracy: three methods vs GT
-    errors_mask   = []   # pipeline method (10th pct of mask)
-    errors_centre = []   # bbox-centre pixel
-    errors_mean   = []   # mean of bbox region
+    errors_mask = []  # pipeline method (10th pct of mask)
+    errors_centre = []  # bbox-centre pixel
+    errors_mean = []  # mean of bbox region
 
     print(f"\nProcessing {len(frames)} frames …")
     t_start = time.perf_counter()
@@ -145,7 +150,7 @@ def run(args):
             timestamp=time.time(),
         )
         scene = pipeline.process_frame(frame)
-        gt_depth = f["depth"]   # unfiltered ground truth
+        gt_depth = f["depth"]  # unfiltered ground truth
 
         n_frames += 1
         n_obj = len(scene.objects)
@@ -157,12 +162,10 @@ def run(args):
             class_counter[obj.class_name] += 1
             direction_counter[obj.direction] += 1
 
-            # Depth accuracy: get the raw YOLO mask for this object
-            # Re-run YOLO to get masks (pipeline already ran it; we access via result)
-            # Simpler: use bbox-based estimators for the GT comparison
+            # Use bbox-based estimators against GT depth
             est = obj.distance_m
             gt_centre = depth_at_bbox_centre(gt_depth, obj.bbox, f["rgb"].shape)
-            gt_mean   = depth_mean_bbox(gt_depth, obj.bbox)
+            gt_mean = depth_mean_bbox(gt_depth, obj.bbox)
 
             if est < float("inf") and gt_centre < float("inf"):
                 errors_centre.append(abs(est - gt_centre))
@@ -181,7 +184,7 @@ def run(args):
     elapsed = time.perf_counter() - t_start
     fps_throughput = n_frames / elapsed
 
-    # ── Print results ─────────────────────────────────────────────────────────
+    # Print results
     total_objects = sum(objects_per_frame)
     print("\n" + "=" * 62)
     print("Evaluation Results")
@@ -231,7 +234,7 @@ def run(args):
 
     print("\n" + "=" * 62)
 
-    # ── Save JSON for report ──────────────────────────────────────────────────
+    # Save JSON for report
     results = {
         "model": args.model,
         "device": device,
@@ -245,7 +248,7 @@ def run(args):
         "free_direction_counts": dict(free_dir_counter),
         "warning_rate_pct": round(warn_pct, 1),
         "depth_mae_bbox_centre": round(statistics.mean(errors_centre), 3) if errors_centre else None,
-        "depth_mae_bbox_mean":   round(statistics.mean(errors_mean), 3)   if errors_mean   else None,
+        "depth_mae_bbox_mean": round(statistics.mean(errors_mean), 3) if errors_mean else None,
     }
     out_path = args.output
     with open(out_path, "w") as fp:
@@ -255,9 +258,9 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GroundSense evaluation on NYU Depth v2")
-    parser.add_argument("--mat",     default="nyu_small.mat", help="Path to nyu_small.mat")
-    parser.add_argument("--frames",  type=int, default=60,    help="Number of frames to evaluate (default: all 60)")
-    parser.add_argument("--model",   default="yolo26s-seg.pt",help="YOLO model file")
-    parser.add_argument("--device",  default=None,            help="torch device (auto if omitted)")
-    parser.add_argument("--output",  default="eval_results.json", help="JSON output path")
+    parser.add_argument("--mat", default="nyu_small.mat", help="Path to nyu_small.mat")
+    parser.add_argument("--frames", type=int, default=60, help="Number of frames to evaluate (default: all 60)")
+    parser.add_argument("--model", default="yolo26s-seg.pt", help="YOLO model file")
+    parser.add_argument("--device", default=None, help="torch device (auto if omitted)")
+    parser.add_argument("--output", default="eval_results.json", help="JSON output path")
     run(parser.parse_args())

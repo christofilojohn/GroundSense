@@ -63,30 +63,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("fake_client")
 
-# NYU Depth v2 Kinect camera intrinsics (standard published values)
+# NYU Depth v2 camera intrinsics
 NYU_INTRINSICS = {"fx": 518.858, "fy": 519.470, "cx": 325.582, "cy": 253.736}
 
 
-# ── MAT file loading ─────────────────────────────────────────────────
+# MAT file loading
+
 
 class NyuDataset:
     """
     Lazy loader for nyu_depth_v2_labeled.mat.
 
-    h5py reads MATLAB v7.3 HDF5 files with reversed dimension order
-    (MATLAB is column-major; h5py is row-major).
-
-    MATLAB layout in file:
-        images  (H, W, 3, N) = (480, 640, 3, 1449)
-        depths  (H, W, N)    = (480, 640, 1449)
-
-    h5py presents them as:
-        images  (N, 3, W, H) = (1449, 3, 640, 480)
-        depths  (N, W, H)    = (1449, 640, 480)
-
-    After transposing to standard (N, H, W, C) / (N, H, W):
-        images  transpose(0, 3, 2, 1) → (N, H, W, 3)
-        depths  transpose(0, 2, 1)    → (N, H, W)
+    h5py presents MATLAB arrays with reversed axes (MATLAB is column-major),
+    so images come out as (N, 3, W, H) and depths as (N, W, H).
+    We transpose back to standard (N, H, W, C) / (N, H, W) on access.
     """
 
     def __init__(self, path: str):
@@ -98,9 +88,6 @@ class NyuDataset:
         log.info(f"  h5py images shape : {self._images.shape}")
         log.info(f"  h5py depths shape : {self._depths.shape}")
 
-        # Detect layout by inspecting the last two spatial dimensions.
-        # Valid frames are 480×640 (H×W); if the shapes are wrong here
-        # the log will tell you and you can flip the transpose below.
         n = self._images.shape[0]
         log.info(f"  Dataset size      : {n} frames")
 
@@ -109,9 +96,9 @@ class NyuDataset:
 
     def __getitem__(self, idx: int):
         """Return (rgb_hwc_uint8, depth_hw_float32) for frame idx."""
-        # Load single frame (avoids pulling the whole 2.8 GB into RAM)
-        raw_img   = self._images[idx]   # (3, W, H) — see class docstring
-        raw_depth = self._depths[idx]   # (W, H)
+        # Load one frame at a time — the full dataset is too large for RAM
+        raw_img = self._images[idx]  # (3, W, H) — see class docstring
+        raw_depth = self._depths[idx]  # (W, H)
 
         # (3, W, H) → (H, W, 3)
         rgb = raw_img.transpose(2, 1, 0).astype(np.uint8)
@@ -125,7 +112,8 @@ class NyuDataset:
         self._f.close()
 
 
-# ── Wire-format packing ──────────────────────────────────────────────
+# Wire-format packing
+
 
 def pack_frame(bgr: np.ndarray, depth: np.ndarray, frame_idx: int) -> bytes:
     """
@@ -136,21 +124,21 @@ def pack_frame(bgr: np.ndarray, depth: np.ndarray, frame_idx: int) -> bytes:
     h, w = bgr.shape[:2]
     dh, dw = depth.shape
 
-    # 1. JPEG-encode the BGR image (server decodes with cv2.IMREAD_COLOR → BGR)
+    # 1. JPEG-encode the BGR image
     ok, jpeg_buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
         raise RuntimeError("JPEG encoding failed")
     jpeg_bytes = jpeg_buf.tobytes()
 
-    # 2. Depth as raw float16 (halves bandwidth, matches iPhone behaviour)
+    # 2. Depth as float16 (matches iPhone wire format)
     depth_bytes = depth.astype(np.float16).tobytes()
 
-    # 3. Metadata JSON (server reads depthWidth/depthHeight to reshape depth)
+    # 3. Metadata JSON
     meta = {
-        "timestamp":  time.time(),
-        "rgbWidth":   w,
-        "rgbHeight":  h,
-        "depthWidth":  dw,
+        "timestamp": time.time(),
+        "rgbWidth": w,
+        "rgbHeight": h,
+        "depthWidth": dw,
         "depthHeight": dh,
         "intrinsics": [
             NYU_INTRINSICS["fx"],
@@ -159,26 +147,29 @@ def pack_frame(bgr: np.ndarray, depth: np.ndarray, frame_idx: int) -> bytes:
             NYU_INTRINSICS["cy"],
         ],
         "frameIndex": frame_idx,
-        "source":     "nyu_depth_v2",
+        "source": "nyu_depth_v2",
         "orientation": "landscape",
     }
     meta_bytes = json.dumps(meta).encode("utf-8")
 
     # 4. Concatenate: [size][data] × 3
     return (
-        struct.pack("<I", len(jpeg_bytes)) + jpeg_bytes
-        + struct.pack("<I", len(depth_bytes)) + depth_bytes
-        + struct.pack("<I", len(meta_bytes)) + meta_bytes
+        struct.pack("<I", len(jpeg_bytes))
+        + jpeg_bytes
+        + struct.pack("<I", len(depth_bytes))
+        + depth_bytes
+        + struct.pack("<I", len(meta_bytes))
+        + meta_bytes
     )
 
 
-# ── Display window ───────────────────────────────────────────────────
+# Display window
 
 _ALERT = 1.0
-_WARN  = 2.0
+_WARN = 2.0
 
 # Stored so interactive_query can log to terminal (no longer drawn on screen)
-_last_query  = ""
+_last_query = ""
 _last_answer = ""
 _last_source = ""
 
@@ -199,18 +190,15 @@ def render_frame(bgr: np.ndarray, scene: dict | None = None):
             x1, y1 = int(nx1 * w), int(ny1 * h)
             x2, y2 = int(nx2 * w), int(ny2 * h)
             d = obj["distance_m"]
-            colour = (
-                (0, 0, 220)   if d < _ALERT else
-                (0, 140, 255) if d < _WARN  else
-                (50, 200, 50)
-            )
+            colour = (0, 0, 220) if d < _ALERT else (0, 140, 255) if d < _WARN else (50, 200, 50)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 2)
 
     cv2.imshow("GroundSense", canvas)
     cv2.waitKey(1)
 
 
-# ── Preview helper ───────────────────────────────────────────────────
+# Preview helper
+
 
 def save_preview(dataset: NyuDataset, idx: int = 0):
     """Save RGB + depth-heatmap PNGs for visual sanity-check."""
@@ -226,13 +214,12 @@ def save_preview(dataset: NyuDataset, idx: int = 0):
     cv2.imwrite("preview_depth.png", heatmap)
 
     log.info(f"Saved preview_rgb.png and preview_depth.png  (frame {idx})")
-    log.info(f"  RGB   shape: {rgb.shape}   dtype: {rgb.dtype}   "
-             f"range [{rgb.min()}, {rgb.max()}]")
-    log.info(f"  Depth shape: {depth.shape}  dtype: {depth.dtype}  "
-             f"range [{depth.min():.2f}, {depth.max():.2f}] m")
+    log.info(f"  RGB   shape: {rgb.shape}   dtype: {rgb.dtype}   " f"range [{rgb.min()}, {rgb.max()}]")
+    log.info(f"  Depth shape: {depth.shape}  dtype: {depth.dtype}  " f"range [{depth.min():.2f}, {depth.max():.2f}] m")
 
 
-# ── WebSocket streaming ──────────────────────────────────────────────
+# WebSocket streaming
+
 
 async def stream(
     server: str,
@@ -263,18 +250,14 @@ async def stream(
 
                 if resp.get("type") == "scene_update":
                     scene = resp["scene"]
-                    objs  = scene["objects"]
-                    free  = scene["free_direction"]
+                    objs = scene["objects"]
+                    free = scene["free_direction"]
                     close = scene["closest_obstacle_m"]
 
-                    obj_str = "  ".join(
-                        f"{o['class']} {o['distance_m']}m {o['direction']}"
-                        for o in objs[:4]
-                    ) or "(none)"
-                    log.info(
-                        f"  [{i:4d}] {len(objs)} obj | free={free} | "
-                        f"closest={close:.1f}m | {obj_str}"
+                    obj_str = (
+                        "  ".join(f"{o['class']} {o['distance_m']}m {o['direction']}" for o in objs[:4]) or "(none)"
                     )
+                    log.info(f"  [{i:4d}] {len(objs)} obj | free={free} | " f"closest={close:.1f}m | {obj_str}")
                     if "warning" in resp:
                         log.warning(f"  ⚠  {resp['warning']}")
 
@@ -290,11 +273,10 @@ async def stream(
                 await asyncio.sleep(wait)
 
         log.info("Stream finished.")
-        return ws   # caller may reuse for interactive queries
+        return ws  # caller may reuse for interactive queries
 
 
-async def interactive_query(ws, initial_query: str = "", display: bool = False,
-                            last_bgr=None, last_scene=None):
+async def interactive_query(ws, initial_query: str = "", display: bool = False, last_bgr=None, last_scene=None):
     """Send one or more text queries and print the answers."""
     global _last_query, _last_answer, _last_source
 
@@ -336,11 +318,11 @@ async def interactive_query(ws, initial_query: str = "", display: bool = False,
             await ask(q)
 
 
-# ── .gsrecording playback ────────────────────────────────────────────
+# .gsrecording playback
 
 # Magic bytes written by iOS RecordingManager.swift
-_GSREC_MAGIC   = b"GSREC\x01\x00\n"
-_GSREC_HEADER  = 32   # fixed header size in bytes
+_GSREC_MAGIC = b"GSREC\x01\x00\n"
+_GSREC_HEADER = 32  # fixed header size in bytes
 
 
 def read_gsrecording(path: str):
@@ -366,17 +348,15 @@ def read_gsrecording(path: str):
 
         magic = header[0:8]
         if magic != _GSREC_MAGIC:
-            raise ValueError(
-                f"{path}: bad magic bytes {magic!r}. "
-                "Is this a GroundSense .gsrecording file?"
-            )
+            raise ValueError(f"{path}: bad magic bytes {magic!r}. " "Is this a GroundSense .gsrecording file?")
 
-        fps_mhz     = struct.unpack_from("<I", header, 12)[0]
+        fps_mhz = struct.unpack_from("<I", header, 12)[0]
         frame_count = struct.unpack_from("<I", header, 16)[0]
-        created_at  = struct.unpack_from("<d", header, 20)[0]
-        fps         = fps_mhz / 1000.0
+        created_at = struct.unpack_from("<d", header, 20)[0]
+        fps = fps_mhz / 1000.0
 
         import datetime
+
         ts_str = datetime.datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
         log.info(f"Recording: {frame_count} frames @ {fps:.1f} fps  created {ts_str}")
 
@@ -391,7 +371,7 @@ def read_gsrecording(path: str):
                     log.warning(f"  Truncated at frame {i}, block {_}")
                     ok = False
                     break
-                sz   = struct.unpack("<I", sz_bytes)[0]
+                sz = struct.unpack("<I", sz_bytes)[0]
                 data = f.read(sz)
                 if len(data) < sz:
                     log.warning(f"  Short read at frame {i}: expected {sz}, got {len(data)}")
@@ -491,13 +471,12 @@ async def stream_gsrecording(
                 if resp.get("type") == "scene_update":
                     scene = resp["scene"]
                     last_scene = scene
-                    objs  = scene["objects"]
-                    free  = scene["free_direction"]
+                    objs = scene["objects"]
+                    free = scene["free_direction"]
                     close = scene["closest_obstacle_m"]
-                    obj_str = "  ".join(
-                        f"{o['class']} {o['distance_m']}m {o['direction']}"
-                        for o in objs[:4]
-                    ) or "(none)"
+                    obj_str = (
+                        "  ".join(f"{o['class']} {o['distance_m']}m {o['direction']}" for o in objs[:4]) or "(none)"
+                    )
                     log.info(
                         f"  [{i:4d}/{len(packets)}] {len(objs)} obj | "
                         f"free={free} | closest={close:.1f}m | {obj_str}"
@@ -522,11 +501,12 @@ async def stream_gsrecording(
             await interactive_query(ws, query)
 
 
-# ── Entry point ───────────────────────────────────────────────────────
+# Entry point
+
 
 async def main_async(args):
 
-    # ── Recording playback mode ──────────────────────────────────────
+    # Recording playback mode
     if args.recording:
         await stream_gsrecording(
             server=args.server,
@@ -538,7 +518,7 @@ async def main_async(args):
         )
         return
 
-    # ── NYU dataset streaming mode ───────────────────────────────────
+    # NYU dataset streaming mode
     dataset = NyuDataset(args.mat)
 
     try:
@@ -556,18 +536,13 @@ async def main_async(args):
             cv2.namedWindow("GroundSense", cv2.WINDOW_NORMAL)
 
         log.info(f"Connecting to {args.server} …")
-        async with websockets.connect(
-            args.server, max_size=10 * 1024 * 1024
-        ) as ws:
+        async with websockets.connect(args.server, max_size=10 * 1024 * 1024) as ws:
             await _send_set_pipeline(ws, args.pipeline)
             # Activate open-vocab targets before the first frame
             await _send_set_targets(ws, args.targets)
-            log.info(
-                f"Connected. Streaming frames {args.start}–{end - 1} "
-                f"at {args.fps:.1f} fps"
-            )
+            log.info(f"Connected. Streaming frames {args.start}–{end - 1} " f"at {args.fps:.1f} fps")
 
-            last_bgr   = None
+            last_bgr = None
             last_scene = None
 
             for i in range(args.start, end):
@@ -587,17 +562,13 @@ async def main_async(args):
                     if resp.get("type") == "scene_update":
                         scene = resp["scene"]
                         last_scene = scene
-                        objs  = scene["objects"]
-                        free  = scene["free_direction"]
+                        objs = scene["objects"]
+                        free = scene["free_direction"]
                         close = scene["closest_obstacle_m"]
-                        obj_str = "  ".join(
-                            f"{o['class']} {o['distance_m']}m {o['direction']}"
-                            for o in objs[:4]
-                        ) or "(none)"
-                        log.info(
-                            f"  [{i:4d}] {len(objs)} obj | free={free} | "
-                            f"closest={close:.1f}m | {obj_str}"
+                        obj_str = (
+                            "  ".join(f"{o['class']} {o['distance_m']}m {o['direction']}" for o in objs[:4]) or "(none)"
                         )
+                        log.info(f"  [{i:4d}] {len(objs)} obj | free={free} | " f"closest={close:.1f}m | {obj_str}")
                         if "warning" in resp:
                             log.warning(f"  ⚠  {resp['warning']}")
                     else:
@@ -623,7 +594,8 @@ async def main_async(args):
 
             log.info("Stream finished.")
             await interactive_query(
-                ws, args.query,
+                ws,
+                args.query,
                 display=args.display,
                 last_bgr=last_bgr,
                 last_scene=last_scene,
@@ -646,7 +618,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # ── Recording playback ──────────────────────────────────────────
+    # Recording playback
     rec_group = parser.add_argument_group("Recording playback (iPhone captures)")
     rec_group.add_argument(
         "--recording",
@@ -663,13 +635,10 @@ def main():
         type=float,
         default=0.0,
         metavar="FPS",
-        help=(
-            "Override playback speed for --recording mode. "
-            "0 = use the fps stored in the recording (default)."
-        ),
+        help=("Override playback speed for --recording mode. " "0 = use the fps stored in the recording (default)."),
     )
 
-    # ── NYU dataset streaming ───────────────────────────────────────
+    # NYU dataset streaming
     nyu_group = parser.add_argument_group("NYU dataset streaming (default mode)")
     nyu_group.add_argument(
         "--mat",
@@ -705,7 +674,7 @@ def main():
         help="Open a live window showing RGB + detections (press q to quit)",
     )
 
-    # ── Shared ──────────────────────────────────────────────────────
+    # Shared
     parser.add_argument(
         "--server",
         default="ws://localhost:8765",
