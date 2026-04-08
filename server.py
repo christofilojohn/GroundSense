@@ -1063,6 +1063,13 @@ class GroundSenseServer:
         self.last_scene: Optional[SceneState] = None
         self.inference_interval = inference_interval
 
+        # Default open-vocab targets — active immediately without needing a
+        # set_targets message from the app.
+        if open_vocab:
+            self.open_vocab.set_targets(
+                ["person", "laptop", "tv", "chair", "dustbin", "wall"]
+            )
+
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
         logger.info(f"Client connected: {client_addr}")
