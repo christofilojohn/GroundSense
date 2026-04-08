@@ -80,6 +80,7 @@ struct ContentView: View {
                 // ── Bottom controls ──────────────────────────────────
                 BottomControls(
                     captureManager: captureManager,
+                    recordingManager: captureManager.recordingManager,
                     serverAddress: $serverAddress,
                     showQRScanner: $showQRScanner,
                     showGallery: $showGallery
@@ -252,6 +253,7 @@ private struct WarningBanner: View {
 
 private struct BottomControls: View {
     @ObservedObject var captureManager: ARCaptureManager
+    @ObservedObject var recordingManager: RecordingManager
     @Binding var serverAddress: String
     @Binding var showQRScanner: Bool
     @Binding var showGallery: Bool
@@ -381,7 +383,7 @@ private struct BottomControls: View {
                     VStack(spacing: 4) {
                         Image(systemName: "film.stack")
                             .font(.title2)
-                        Text("\(captureManager.recordingManager.recordings.count)")
+                        Text("\(recordingManager.recordings.count)")
                             .font(.caption2.weight(.bold))
                     }
                     .frame(width: 64, height: 56)
