@@ -40,8 +40,7 @@ def validate_forwarded_args(extra_args: list[str]) -> None:
     for arg in extra_args:
         if arg == "--device" or arg.startswith("--device="):
             raise SystemExit(
-                "benchmark_devices.py manages --device itself. "
-                "Use --devices to choose one or more targets."
+                "benchmark_devices.py manages --device itself. " "Use --devices to choose one or more targets."
             )
 
 
@@ -58,9 +57,7 @@ def run_for_device(benchmark_script: Path, device: str, extra_args: list[str]) -
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Run benchmark.py on CPU, CUDA, or other supported devices."
-    )
+    parser = argparse.ArgumentParser(description="Run benchmark.py on CPU, CUDA, or other supported devices.")
     parser.add_argument(
         "--devices",
         nargs="+",

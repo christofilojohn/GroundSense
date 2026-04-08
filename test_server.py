@@ -3,9 +3,11 @@ Minimal WebSocket test server — no ML dependencies.
 Run: python test_server.py
 Then connect the app to ws://<mac-ip>:8765
 """
+
 import asyncio
 import websockets
 import socket
+
 
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -16,6 +18,7 @@ def get_ip():
         return "unknown"
     finally:
         s.close()
+
 
 async def handler(websocket):
     print(f"✅ iPhone connected from {websocket.remote_address}")
@@ -31,6 +34,7 @@ async def handler(websocket):
     except websockets.exceptions.ConnectionClosed:
         print(f"  Disconnected after {frame_count} frames")
 
+
 async def main():
     ip = get_ip()
     print(f"\n{'='*50}")
@@ -39,5 +43,6 @@ async def main():
     print(f"{'='*50}\n")
     async with websockets.serve(handler, "0.0.0.0", 8765):
         await asyncio.Future()
+
 
 asyncio.run(main())
