@@ -44,12 +44,11 @@ try:
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
-try:
-    import qrcode as _qrcode_mod
 
-    HAS_QRCODE = True
-except ImportError:
-    HAS_QRCODE = False
+import qrcode as _qrcode_mod
+
+HAS_QRCODE = True
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("groundsense")
@@ -1064,6 +1063,13 @@ class GroundSenseServer:
         self.last_scene: Optional[SceneState] = None
         self.inference_interval = inference_interval
 
+        # Default open-vocab targets — active immediately without needing a
+        # set_targets message from the app.
+        if open_vocab:
+            self.open_vocab.set_targets(
+                ["person", "laptop", "tv", "chair", "dustbin", "wall"]
+            )
+
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
         logger.info(f"Client connected: {client_addr}")
@@ -1411,43 +1417,108 @@ def _get_local_ips() -> dict:
     """
     Return a dict of interface-name → IP for every active non-loopback interface.
     Used at startup so you can see exactly which address to type into the app.
+    Works on macOS, Linux, and Windows.
     """
-    import subprocess, re
+    import socket
+    import subprocess
+    import re
+    import sys
 
     ips = {}
+
+    # Cross-platform fallback: enumerate IPs via socket
     try:
-        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
-        # Match blocks like "en0: ... inet 192.168.x.x"
-        for block in re.split(r"\n(?=\S)", out):
-            iface = re.match(r"^(\S+):", block)
-            addr = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", block)
-            if iface and addr and not addr.group(1).startswith("127."):
-                ips[iface.group(1)] = addr.group(1)
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            ip = info[4][0]
+            if ":" in ip:  # skip IPv6
+                continue
+            if ip.startswith("127."):
+                continue
+            if ip not in ips.values():
+                ips[f"if{len(ips)}"] = ip
     except Exception:
         pass
+
+    if sys.platform == "win32":
+        # On Windows use ipconfig for named interfaces
+        try:
+            out = subprocess.check_output(["ipconfig"], text=True, stderr=subprocess.DEVNULL)
+            current_iface = "unknown"
+            for line in out.splitlines():
+                iface_match = re.match(r"^(\S.*):$", line.strip())
+                if iface_match:
+                    current_iface = iface_match.group(1)
+                addr_match = re.search(r"IPv4 Address[^:]*:\s*([\d.]+)", line)
+                if addr_match:
+                    ip = addr_match.group(1)
+                    if not ip.startswith("127."):
+                        ips[current_iface] = ip
+        except Exception:
+            pass
+    else:
+        # macOS / Linux: use ifconfig
+        try:
+            out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+            for block in re.split(r"\n(?=\S)", out):
+                iface = re.match(r"^(\S+):", block)
+                addr = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", block)
+                if iface and addr and not addr.group(1).startswith("127."):
+                    ips[iface.group(1)] = addr.group(1)
+        except Exception:
+            pass
+
     return ips
 
 
 def _get_best_url(port: int) -> str:
-    """Return the single best WebSocket URL to advertise (hotspot > USB > Wi-Fi)."""
+    """Return the single best WebSocket URL to advertise (hotspot > USB > Wi-Fi > any routable)."""
     ips = _get_local_ips()
+
+    def is_link_local(ip: str) -> bool:
+        return ip.startswith("169.254.")
+
+    routable = {iface: ip for iface, ip in ips.items() if not is_link_local(ip)}
+
     best_ip: Optional[str] = None
-    for iface, ip in ips.items():
-        if ip.startswith("192.168.2."):  # Mac hotspot
+
+    # 1. Mac/Windows hotspot (192.168.2.x)
+    for iface, ip in routable.items():
+        if ip.startswith("192.168.2."):
             best_ip = ip
             break
+
+    # 2. USB tethering — Mac bridge interfaces or Windows "Local Area Connection*"
     if best_ip is None:
-        for iface, ip in ips.items():
-            if "bridge" in iface or iface in ("en5", "en6", "en7", "en8"):  # USB
+        for iface, ip in routable.items():
+            if "bridge" in iface.lower() or iface in ("en5", "en6", "en7", "en8"):
                 best_ip = ip
                 break
+
+    # 3. Wi-Fi / LAN — Mac en0/en1 or Windows "Wi-Fi" / "Ethernet"
     if best_ip is None:
-        for iface, ip in ips.items():
-            if iface.startswith("en0") or iface.startswith("en1"):  # Wi-Fi
+        for iface, ip in routable.items():
+            iface_lower = iface.lower()
+            if (
+                iface.startswith("en0")
+                or iface.startswith("en1")
+                or "wi-fi" in iface_lower
+                or "wireless" in iface_lower
+                or "ethernet" in iface_lower
+                or ip.startswith("192.168.")
+                or ip.startswith("10.")
+            ):
                 best_ip = ip
                 break
+
+    # 4. Any routable address
+    if best_ip is None and routable:
+        best_ip = next(iter(routable.values()))
+
+    # 5. Last resort: link-local
     if best_ip is None and ips:
         best_ip = next(iter(ips.values()))
+
     return f"ws://{best_ip}:{port}" if best_ip else ""
 
 
