@@ -1,0 +1,30 @@
+======================================================================
+GroundSense Latency Benchmark
+  device  : mps
+  frames  : 60 measurement + 3 warm-up
+======================================================================
+Loading NYU Depth v2 from nyu_small.mat …
+  Using 60/60 frames
+  [!] Only 60 frames available; adjusting.
+
+[1/4] Depth bilateral filter
+
+[2/4] YOLO segmentation + LiDAR depth fusion  (device=mps)
+  Warm-up (3 frames) … done
+
+[3/4] Open-vocabulary pipeline  (targets: ['chair', 'bottle'])
+  Warm-up (3 frames) … done
+
+[4/4] Gemini query latency  SKIPPED (no --gemini-key)
+
+======================================================================
+Results
+======================================================================
+  Depth bilateral filter               mean=   1.7 ms  median=   1.6 ms  p90=   2.0 ms  stdev=  0.2 ms  [n=57]
+  YOLO26s-seg + track                  mean=  44.1 ms  median=  42.1 ms  p90=  53.7 ms  stdev=  8.6 ms  [n=57]
+  LiDAR depth fusion                   mean=   1.6 ms  median=   0.0 ms  p90=   5.0 ms  stdev=  2.8 ms  [n=57]
+  Grounding DINO-tiny                  mean= 743.8 ms  median= 735.9 ms  p90= 756.0 ms  stdev= 29.9 ms  [n=57]
+  FastSAM-s                            mean= 125.7 ms  median= 112.2 ms  p90= 169.8 ms  stdev= 48.4 ms  [n=57]
+
+  End-to-end (primary pipeline)        ~44 ms  (depth + YOLO + fusion, median)
+======================================================================

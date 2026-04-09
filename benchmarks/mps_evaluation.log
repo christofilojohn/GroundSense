@@ -1,0 +1,61 @@
+Device: mps  |  Model: yolo26s-seg.pt
+Loading nyu_small.mat …
+  60/60 frames
+
+Processing 60 frames …
+  10/60 frames …
+  20/60 frames …
+  30/60 frames …
+  40/60 frames …
+  50/60 frames …
+  60/60 frames …
+
+==============================================================
+Evaluation Results
+==============================================================
+
+Frames processed                         60
+Throughput                               9.7 fps
+
+--- Detection ---
+  Detection rate (≥1 object)             30.0%
+  Total objects detected                 20
+  Mean objects / frame                   0.33
+  Median objects / frame                 0.0
+  Max objects in a frame                 3
+
+--- Top-10 Detected Classes ---
+  refrigerator                 5  (25.0%)
+  chair                        5  (25.0%)
+  clock                        2  (10.0%)
+  toilet                       2  (10.0%)
+  microwave                    1  (5.0%)
+  potted plant                 1  (5.0%)
+  tv                           1  (5.0%)
+  couch                        1  (5.0%)
+  bed                          1  (5.0%)
+  handbag                      1  (5.0%)
+
+--- Spatial Direction of Detections ---
+  left         10  (50.0%)
+  center        7  (35.0%)
+  right         3  (15.0%)
+
+--- Depth Estimation Accuracy (MAE vs NYU GT) ---
+  Method                                    MAE (m)      n
+  -------------------------------------------------------
+  Bbox-centre pixel (baseline)                0.100     20
+  Mean depth in bbox (baseline)               0.108     20
+  (Pipeline uses 10th-pct within mask — mask data not re-exposed here;
+   bbox-centre MAE serves as upper bound for the pipeline estimate.)
+
+--- Obstacle Warning Rate ---
+  Frames triggering a warning              10 / 60  (16.7%)
+
+--- Free-Direction Distribution ---
+  left         36  (60.0%)
+  center       19  (31.7%)
+  right         5  (8.3%)
+
+==============================================================
+Results saved to eval_results.json
