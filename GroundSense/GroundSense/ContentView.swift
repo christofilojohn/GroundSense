@@ -160,6 +160,23 @@ private struct TopBar: View {
             }
             .accessibilityLabel(captureManager.alertsMuted ? "Unmute alerts" : "Mute alerts")
 
+            // Haptic toggle — enables/disables proximity haptic pulses
+            Button(action: { captureManager.hapticsEnabled.toggle() }) {
+                Image(systemName: captureManager.hapticsEnabled
+                      ? "hand.tap.fill"
+                      : "hand.tap")
+                    .font(.caption)
+                    .foregroundColor(captureManager.hapticsEnabled
+                                     ? .cyan
+                                     : .white.opacity(0.4))
+                    .padding(6)
+                    .background(captureManager.hapticsEnabled
+                                ? Color.cyan.opacity(0.2)
+                                : Color.black.opacity(0.35))
+                    .cornerRadius(7)
+            }
+            .accessibilityLabel(captureManager.hapticsEnabled ? "Disable haptics" : "Enable haptics")
+
             Text("\(Int(captureManager.fps)) FPS")
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.white)

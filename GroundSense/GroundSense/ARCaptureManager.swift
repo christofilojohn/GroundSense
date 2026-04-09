@@ -32,6 +32,11 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     /// When true the spoken obstacle warnings are suppressed; visual banner still shows.
     @Published var alertsMuted: Bool = false
 
+    // MARK: - Haptic alerts
+    /// When true haptic proximity pulses fire on each scene_update with close objects.
+    @Published var hapticsEnabled: Bool = true
+    private let hapticManager = HapticFeedbackManager()
+
     // MARK: - Detection pipeline mode
     /// Active server-side pipeline.  Mirrors the server's _pipeline_mode.
     /// "yolo" | "gdino" | "both"
@@ -241,6 +246,12 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                     )
                 }
                 DispatchQueue.main.async { self.sceneObjects = parsed }
+
+                // Haptic feedback — runs on the current (background) thread;
+                // HapticFeedbackManager is fully thread-safe.
+                if hapticsEnabled {
+                    hapticManager.update(objects: parsed)
+                }
             }
 
             // ── Warnings & query responses ────────────────────────────
