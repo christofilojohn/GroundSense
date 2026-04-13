@@ -86,6 +86,8 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     /// Answer text waiting to be spoken — held until the MP3 arrives or the
     /// fallback timer fires, whichever comes first.
     private var pendingQueryAnswer: String = ""
+    /// True while a fallback query answer is being spoken via AVSpeechSynthesizer.
+    private var clearsPendingQueryAnswerOnSpeechEnd = false
     /// Fires ~1.5 s after a query_response if no binary audio has arrived yet,
     /// falling back to on-device AVSpeechSynthesizer.
     private var audioFallbackTimer: Timer?
@@ -287,8 +289,7 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                 audioFallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.5,
                                                           repeats: false) { [weak self] _ in
                     guard let self, !self.pendingQueryAnswer.isEmpty else { return }
-                    self.speakForced(self.pendingQueryAnswer)
-                    self.pendingQueryAnswer = ""
+                    self.speakPendingQueryAnswerFallback()
                 }
             }
 
@@ -297,7 +298,6 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             guard !data.isEmpty else { return }
             audioFallbackTimer?.invalidate()
             audioFallbackTimer = nil
-            pendingQueryAnswer = ""
             playAudioResponse(data)
 
         @unknown default:
@@ -324,14 +324,27 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
             audioPlayer = try AVAudioPlayer(data: mp3Data,
                                             fileTypeHint: AVFileType.mp3.rawValue)
             audioPlayer?.volume = 1.0
-            audioPlayer?.play()
+            guard audioPlayer?.play() == true else {
+                throw NSError(domain: "ARCaptureManager.AudioPlayback",
+                              code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "AVAudioPlayer failed to start playback"])
+            }
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
         } catch {
             // If MP3 playback fails for any reason, fall back to on-device TTS.
             print("AVAudioPlayer error: \(error) — falling back to AVSpeechSynthesizer")
-            let fallback = pendingQueryAnswer
-            if !fallback.isEmpty {
-                speakForced(fallback)
-            }
+            speakPendingQueryAnswerFallback()
+        }
+    }
+
+    private func speakPendingQueryAnswerFallback() {
+        guard !pendingQueryAnswer.isEmpty else { return }
+        clearsPendingQueryAnswerOnSpeechEnd = true
+        speakForced(pendingQueryAnswer)
+        if !speechSynthesizer.isSpeaking {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
         }
     }
 
@@ -759,11 +772,19 @@ extension ARCaptureManager: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                            didFinish utterance: AVSpeechUtterance) {
         lastSpeechEndTime = CACurrentMediaTime()
+        if clearsPendingQueryAnswerOnSpeechEnd {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
+        }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                            didCancel utterance: AVSpeechUtterance) {
         lastSpeechEndTime = CACurrentMediaTime()
+        if clearsPendingQueryAnswerOnSpeechEnd {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
+        }
     }
 }
 

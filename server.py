@@ -174,6 +174,14 @@ class SceneState:
         }
 
 
+@dataclass
+class ClientSession:
+    """Per-websocket state used by frame and query handling."""
+
+    last_scene: Optional[SceneState] = None
+    last_frame: Optional[Frame] = None
+
+
 # Segmentation Pipeline
 
 
@@ -1153,9 +1161,6 @@ class GroundSenseServer:
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
         self.visualizer = Visualizer() if visualize else None
-        # Persistent state — updated every frame, read by query handler
-        self.last_scene: Optional[SceneState] = None
-        self.last_frame: Optional[Frame] = None   # kept for Gemini Vision queries
         self.inference_interval = inference_interval
 
         # Default open-vocab targets — active immediately without needing a
@@ -1167,12 +1172,13 @@ class GroundSenseServer:
 
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
+        session = ClientSession()
         logger.info(f"Client connected: {client_addr}")
 
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    await self._process_frame(websocket, message)
+                    await self._process_frame(session, websocket, message)
                 elif isinstance(message, str):
                     # Peek at the JSON type to route correctly
                     try:
@@ -1182,13 +1188,13 @@ class GroundSenseServer:
                         elif msg.get("type") == "set_pipeline":
                             await self._handle_set_pipeline(websocket, msg)
                         else:
-                            await self._handle_query(websocket, message)
+                            await self._handle_query(session, websocket, message)
                     except json.JSONDecodeError:
-                        await self._handle_query(websocket, message)
+                        await self._handle_query(session, websocket, message)
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client disconnected: {client_addr}")
 
-    async def _process_frame(self, websocket, data: bytes):
+    async def _process_frame(self, session: ClientSession, websocket, data: bytes):
         """Process a binary frame packet."""
         self.frame_count += 1
 
@@ -1202,7 +1208,7 @@ class GroundSenseServer:
         mode = self._pipeline_mode
 
         # Frame skipping: run inference every 5th frame, reuse cached scene otherwise
-        run_inference = (self.frame_count % self.inference_interval == 0) or self.last_scene is None
+        run_inference = (self.frame_count % self.inference_interval == 0) or session.last_scene is None
 
         if run_inference:
             if mode in ("yolo", "both"):
@@ -1228,12 +1234,15 @@ class GroundSenseServer:
                     self._gdino_running = True
                     asyncio.create_task(self._run_gdino_background(frame))
 
-            self.last_scene = scene
-            self.last_frame = frame
+            session.last_scene = scene
         else:
             # Skipped frame — reuse the last scene but update its timestamp
-            scene = self.last_scene
+            scene = session.last_scene
             scene.timestamp = frame.timestamp
+
+        # Always keep last_frame current so Gemini Vision queries use the
+        # freshest possible image, even when inference was skipped this cycle.
+        session.last_frame = frame
 
         # Everything below runs for ALL frames (display + warnings + send)
 
@@ -1260,7 +1269,7 @@ class GroundSenseServer:
                 f"Free: {scene.free_direction}"
             )
 
-    async def _handle_query(self, websocket, query_json: str):
+    async def _handle_query(self, session: ClientSession, websocket, query_json: str):
         """Handle a voice query — returns MP3 audio + metadata JSON.
 
         Flow
@@ -1288,13 +1297,13 @@ class GroundSenseServer:
         if not query_text:
             return
 
-        if self.last_scene is None:
+        if session.last_scene is None:
             answer = "I haven't processed any frames yet. Please start the camera stream first."
             source = "rule-based"
         else:
-            jpeg_bytes = self.last_frame.jpeg_bytes if self.last_frame else None
+            jpeg_bytes = session.last_frame.jpeg_bytes if session.last_frame else None
             answer, source = self.response_gen.answer_query(
-                self.last_scene, query_text, jpeg_bytes=jpeg_bytes
+                session.last_scene, query_text, jpeg_bytes=jpeg_bytes
             )
 
         logger.info(f"Voice query answer [{source}]: '{answer}'")
