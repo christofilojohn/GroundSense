@@ -74,10 +74,11 @@ class ServerStartupError(RuntimeError):
 class Frame:
     """A single captured frame from the iPhone."""
 
-    rgb: np.ndarray  # (H, W, 3) uint8 BGR
+    rgb: np.ndarray              # (H, W, 3) uint8 BGR
     depth: Optional[np.ndarray]  # (Hd, Wd) float32 meters, or None
     metadata: dict
     timestamp: float
+    jpeg_bytes: bytes = field(default_factory=bytes)  # raw JPEG for Gemini Vision
 
     @staticmethod
     def from_bytes(data: bytes) -> "Frame":
@@ -122,6 +123,7 @@ class Frame:
             depth=depth,
             metadata=metadata,
             timestamp=metadata.get("timestamp", time.time()),
+            jpeg_bytes=jpeg_bytes,
         )
 
 
@@ -170,6 +172,14 @@ class SceneState:
             "closest_obstacle_m": round(self.closest_obstacle_m, 2),
             "timestamp": self.timestamp,
         }
+
+
+@dataclass
+class ClientSession:
+    """Per-websocket state used by frame and query handling."""
+
+    last_scene: Optional[SceneState] = None
+    last_frame: Optional[Frame] = None
 
 
 # Segmentation Pipeline
@@ -749,9 +759,25 @@ class ResponseGenerator:
         else:
             return f"{nearest.class_name} {nearest.direction} " f"in {nearest.distance_m:.1f} metres."
 
-    def answer_query(self, scene: SceneState, query: str) -> tuple[str, str]:
-        """Answer a spatial query. Returns (answer, source) where source is 'gemini' or 'rule-based'."""
+    def answer_query(
+        self,
+        scene: SceneState,
+        query: str,
+        jpeg_bytes: Optional[bytes] = None,
+    ) -> tuple[str, str]:
+        """Answer a spatial query. Returns (answer, source).
+
+        When *jpeg_bytes* is provided and Gemini is active, sends the actual
+        camera frame to Gemini Vision for richer, image-aware answers.
+        Falls back to metadata-only Gemini, then rule-based.
+        """
         if self._llm == "gemini":
+            # Prefer vision answer when we have an image
+            if jpeg_bytes:
+                try:
+                    return self._gemini_vision_answer(jpeg_bytes, scene, query), "gemini-vision"
+                except Exception as e:
+                    logger.warning(f"Gemini Vision call failed ({e}), trying metadata-only.")
             try:
                 return self._gemini_answer(scene, query), "gemini"
             except Exception as e:
@@ -760,10 +786,9 @@ class ResponseGenerator:
         return self._rule_based_answer(scene, query), "rule-based"
 
     def _gemini_answer(self, scene: SceneState, query: str) -> str:
-        """Call Gemini with the current scene state as context."""
+        """Call Gemini with scene metadata only (no image)."""
         scene_dict = scene.to_dict()
 
-        # Compact scene description to keep the prompt short and latency low
         if scene_dict["objects"]:
             obj_lines = "\n".join(
                 f"  - {o['class']} | {o['distance_m']} m | {o['direction']}" for o in scene_dict["objects"][:8]
@@ -786,6 +811,83 @@ class ResponseGenerator:
             contents=f"{system_prompt}\n\nUser question: {query}",
         )
         return response.text.strip()
+
+    def _gemini_vision_answer(self, jpeg_bytes: bytes, scene: SceneState, query: str) -> str:
+        """Call Gemini Vision with the actual camera image + scene metadata + user query.
+
+        Richer than _gemini_answer because Gemini sees the real frame — it can
+        answer questions about colour, text, open/closed doors, etc. that YOLO
+        metadata alone cannot describe.
+        """
+        import base64
+
+        scene_dict = scene.to_dict()
+        if scene_dict["objects"]:
+            obj_lines = "\n".join(
+                f"  - {o['class']} | {o['distance_m']} m | {o['direction']}"
+                for o in scene_dict["objects"][:8]
+            )
+        else:
+            obj_lines = "  (none detected)"
+
+        system_text = (
+            "You are a real-time navigation assistant for a visually impaired person. "
+            "You are given a live camera frame and sensor data. "
+            "Answer in plain spoken English, maximum 2 short sentences. "
+            "Be direct and actionable — the response will be read aloud immediately.\n\n"
+            "Sensor data:\n"
+            f"  Free direction to walk: {scene_dict['free_direction']}\n"
+            f"  Closest obstacle: {scene_dict['closest_obstacle_m']} m\n"
+            f"  Detected objects:\n{obj_lines}\n\n"
+            f"User question: {query}"
+        )
+
+        image_b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+
+        response = self._gemini_client.models.generate_content(
+            model=self.GEMINI_MODEL,
+            contents=[
+                {"text": system_text},
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": image_b64,
+                    }
+                },
+            ],
+        )
+        return response.text.strip()
+
+    async def synthesize_speech(self, text: str) -> bytes:
+        """Convert text to MP3 audio bytes using edge-tts (Microsoft neural voices).
+
+        Returns raw MP3 bytes ready to send over WebSocket.
+        Falls back to an empty bytes object if edge-tts is unavailable.
+
+        Install: pip install edge-tts
+        """
+        try:
+            import edge_tts
+            import io
+
+            communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
+            buf = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    buf.write(chunk["data"])
+            audio = buf.getvalue()
+            if not audio:
+                raise RuntimeError("edge-tts returned empty audio")
+            return audio
+        except ImportError:
+            logger.warning(
+                "edge-tts not installed — returning empty audio. "
+                "Install with: pip install edge-tts"
+            )
+            return b""
+        except Exception as exc:
+            logger.warning(f"TTS synthesis failed: {exc}")
+            return b""
 
     def _rule_based_answer(self, scene: SceneState, query: str) -> str:
         """
@@ -1059,8 +1161,6 @@ class GroundSenseServer:
         self.last_warning_time = 0
         self.warning_cooldown = 1.5  # seconds between spoken warnings
         self.visualizer = Visualizer() if visualize else None
-        # Persistent scene state — updated every frame, read by query handler
-        self.last_scene: Optional[SceneState] = None
         self.inference_interval = inference_interval
 
         # Default open-vocab targets — active immediately without needing a
@@ -1072,12 +1172,13 @@ class GroundSenseServer:
 
     async def handle_client(self, websocket):
         client_addr = websocket.remote_address
+        session = ClientSession()
         logger.info(f"Client connected: {client_addr}")
 
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    await self._process_frame(websocket, message)
+                    await self._process_frame(session, websocket, message)
                 elif isinstance(message, str):
                     # Peek at the JSON type to route correctly
                     try:
@@ -1087,92 +1188,13 @@ class GroundSenseServer:
                         elif msg.get("type") == "set_pipeline":
                             await self._handle_set_pipeline(websocket, msg)
                         else:
-                            await self._handle_query(websocket, message)
+                            await self._handle_query(session, websocket, message)
                     except json.JSONDecodeError:
-                        await self._handle_query(websocket, message)
+                        await self._handle_query(session, websocket, message)
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client disconnected: {client_addr}")
 
-    # async def _process_frame(self, websocket, data: bytes):
-    #     """Process a binary frame packet."""
-    #     self.frame_count += 1
-
-    #     try:
-    #         frame = Frame.from_bytes(data)
-    #     except Exception as e:
-    #         logger.error(f"Frame decode error: {e}")
-    #         return
-
-    #     loop = asyncio.get_event_loop()
-    #     mode = self._pipeline_mode   # snapshot — may change between awaits
-
-    #     # Primary pipeline: YOLO
-    #     # Runs synchronous inference in a thread so the event loop stays free.
-    #     # Skipped in "gdino" mode to reduce CPU/GPU load.
-    #     if mode in ("yolo", "both"):
-    #         scene = await loop.run_in_executor(None, self.pipeline.process_frame, frame)
-    #     else:
-    #         # GDINO-only: build a blank scene and still estimate free direction
-    #         # from the raw LiDAR depth map (no bilateral filter, but accurate enough).
-    #         scene = SceneState(timestamp=frame.timestamp)
-    #         scene.free_direction = self.pipeline._estimate_free_direction_lidar(
-    #             frame.depth, []
-    #         )
-
-    #     # Secondary pipeline: Grounding DINO (non-blocking)
-    #     # GDINO inference takes ~500–2000 ms on CPU, far too slow to await
-    #     # on every frame.  Instead:
-    #     #   • Merge the *cached* result from the last completed inference
-    #     #     into this frame's scene immediately (always fast — a list copy).
-    #     #   • Every `interval` frames, if no inference is already running,
-    #     #     fire a background asyncio Task that calls the executor and
-    #     #     updates the cache when done.  The current frame never waits.
-    #     if (self._open_vocab_enabled
-    #             and mode in ("gdino", "both")
-    #             and self.open_vocab.target_objects):
-
-    #         # 1. Use last known result now (stale by at most interval frames)
-    #         ov_objects = list(self.open_vocab._cached)
-    #         if ov_objects:
-    #             scene.objects.extend(ov_objects)
-    #             scene.objects.sort(key=lambda o: o.distance_m)
-    #             scene.closest_obstacle_m = scene.objects[0].distance_m
-
-    #         # 2. Kick off fresh inference in the background if it's due
-    #         self.open_vocab._frame_count += 1
-    #         if (self.open_vocab._frame_count % self.open_vocab.interval == 0
-    #                 and not self._gdino_running
-    #                 and self.open_vocab._ensure_loaded()):
-    #             self._gdino_running = True
-    #             asyncio.create_task(self._run_gdino_background(frame))
-
-    #     # Persist scene for query handler
-    #     self.last_scene = scene
-
-    #     # Generate obstacle warning (with cooldown)
-    #     now = time.time()
-    #     response = {"type": "scene_update", "scene": scene.to_dict()}
-
-    #     if now - self.last_warning_time > self.warning_cooldown:
-    #         warning = self.response_gen.generate_obstacle_warning(scene)
-    #         if warning:
-    #             response["warning"] = warning
-    #             self.last_warning_time = now
-
-    #     await websocket.send(json.dumps(response))
-
-    #     # Update live window (if --visualize was passed)
-    #     if self.visualizer is not None:
-    #         self.visualizer.update(frame, scene)
-
-    #     if self.frame_count % 30 == 0:
-    #         logger.info(
-    #             f"Processed {self.frame_count} frames | "
-    #             f"Objects: {len(scene.objects)} | "
-    #             f"Closest: {scene.closest_obstacle_m:.1f}m | "
-    #             f"Free: {scene.free_direction}"
-    #         )
-    async def _process_frame(self, websocket, data: bytes):
+    async def _process_frame(self, session: ClientSession, websocket, data: bytes):
         """Process a binary frame packet."""
         self.frame_count += 1
 
@@ -1186,7 +1208,7 @@ class GroundSenseServer:
         mode = self._pipeline_mode
 
         # Frame skipping: run inference every 5th frame, reuse cached scene otherwise
-        run_inference = (self.frame_count % self.inference_interval == 0) or self.last_scene is None
+        run_inference = (self.frame_count % self.inference_interval == 0) or session.last_scene is None
 
         if run_inference:
             if mode in ("yolo", "both"):
@@ -1212,11 +1234,15 @@ class GroundSenseServer:
                     self._gdino_running = True
                     asyncio.create_task(self._run_gdino_background(frame))
 
-            self.last_scene = scene
+            session.last_scene = scene
         else:
             # Skipped frame — reuse the last scene but update its timestamp
-            scene = self.last_scene
+            scene = session.last_scene
             scene.timestamp = frame.timestamp
+
+        # Always keep last_frame current so Gemini Vision queries use the
+        # freshest possible image, even when inference was skipped this cycle.
+        session.last_frame = frame
 
         # Everything below runs for ALL frames (display + warnings + send)
 
@@ -1243,8 +1269,22 @@ class GroundSenseServer:
                 f"Free: {scene.free_direction}"
             )
 
-    async def _handle_query(self, websocket, query_json: str):
-        """Handle a voice query from the user using the last known scene state."""
+    async def _handle_query(self, session: ClientSession, websocket, query_json: str):
+        """Handle a voice query — returns MP3 audio + metadata JSON.
+
+        Flow
+        ────
+        1. Parse the transcribed query text from the iPhone.
+        2. Call Gemini Vision (image + scene metadata) → answer text.
+           Falls back to metadata-only Gemini, then rule-based engine.
+        3. Synthesize the answer with edge-tts → MP3 bytes.
+        4. Send two WebSocket messages back to the iPhone:
+             a. Text JSON  {"type": "query_response", "query": ..., "answer": ..., "source": ...}
+                so the app can display the text / subtitle if desired.
+             b. Binary MP3 bytes — the iPhone plays this directly with AVAudioPlayer.
+                Empty (b"") when TTS is unavailable; the app should fall back to
+                its own TTS in that case.
+        """
         try:
             query_data = json.loads(query_json)
             query_text = query_data.get("query", "")
@@ -1257,19 +1297,30 @@ class GroundSenseServer:
         if not query_text:
             return
 
-        if self.last_scene is None:
-            answer, source = "I haven't processed any frames yet. Please start the camera stream first.", "rule-based"
+        if session.last_scene is None:
+            answer = "I haven't processed any frames yet. Please start the camera stream first."
+            source = "rule-based"
         else:
-            answer, source = self.response_gen.answer_query(self.last_scene, query_text)
+            jpeg_bytes = session.last_frame.jpeg_bytes if session.last_frame else None
+            answer, source = self.response_gen.answer_query(
+                session.last_scene, query_text, jpeg_bytes=jpeg_bytes
+            )
 
-        logger.info(f"Query answer [{source}]: '{answer}'")
-        response = {
+        logger.info(f"Voice query answer [{source}]: '{answer}'")
+
+        # 1. Send text metadata first (fast)
+        await websocket.send(json.dumps({
             "type": "query_response",
             "query": query_text,
             "answer": answer,
             "source": source,
-        }
-        await websocket.send(json.dumps(response))
+        }))
+
+        # 2. Synthesize and send audio (may take ~200-400 ms)
+        audio_bytes = await self.response_gen.synthesize_speech(answer)
+        if audio_bytes:
+            await websocket.send(audio_bytes)
+            logger.info(f"Sent TTS audio ({len(audio_bytes):,} bytes)")
 
     async def _handle_set_targets(self, websocket, msg: dict):
         """
@@ -1791,4 +1842,5 @@ if __name__ == "__main__":
         args.gemini_key,
         open_vocab=args.open_vocab,
         gdino_interval=args.gdino_interval,
+        inference_interval=args.inference_interval,
     )

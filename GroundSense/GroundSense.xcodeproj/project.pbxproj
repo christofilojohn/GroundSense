@@ -10,6 +10,7 @@
 		AA0000001111222233334402 /* RecordingManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334401 /* RecordingManager.swift */; };
 		AA0000001111222233334404 /* RecordingGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334403 /* RecordingGalleryView.swift */; };
 		AA0000001111222233334406 /* LogoIdleScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334405 /* LogoIdleScreen.swift */; };
+		AA0000001111222233334408 /* HapticFeedbackManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001111222233334407 /* HapticFeedbackManager.swift */; };
 		B8C9D0E8B3F2A1C0D4E5F612 /* GroundSenseApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F604 /* GroundSenseApp.swift */; };
 		B8C9D0E8B3F2A1C0D4E5F613 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F605 /* ContentView.swift */; };
 		B8C9D0E8B3F2A1C0D4E5F614 /* ARCaptureManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8C9D0E8B3F2A1C0D4E5F606 /* ARCaptureManager.swift */; };
@@ -20,6 +21,7 @@
 		AA0000001111222233334401 /* RecordingManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingManager.swift; sourceTree = "<group>"; };
 		AA0000001111222233334403 /* RecordingGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingGalleryView.swift; sourceTree = "<group>"; };
 		AA0000001111222233334405 /* LogoIdleScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogoIdleScreen.swift; sourceTree = "<group>"; };
+		AA0000001111222233334407 /* HapticFeedbackManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HapticFeedbackManager.swift; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F604 /* GroundSenseApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroundSenseApp.swift; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F605 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B8C9D0E8B3F2A1C0D4E5F606 /* ARCaptureManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARCaptureManager.swift; sourceTree = "<group>"; };
@@ -64,6 +66,7 @@
 				AA0000001111222233334401 /* RecordingManager.swift */,
 				AA0000001111222233334403 /* RecordingGalleryView.swift */,
 				AA0000001111222233334405 /* LogoIdleScreen.swift */,
+				AA0000001111222233334407 /* HapticFeedbackManager.swift */,
 				B8C9D0E8B3F2A1C0D4E5F607 /* Info.plist */,
 				B8C9D0E8B3F2A1C0D4E5F608 /* Assets.xcassets */,
 			);
@@ -145,6 +148,7 @@
 				AA0000001111222233334402 /* RecordingManager.swift in Sources */,
 				AA0000001111222233334404 /* RecordingGalleryView.swift in Sources */,
 				AA0000001111222233334406 /* LogoIdleScreen.swift in Sources */,
+				AA0000001111222233334408 /* HapticFeedbackManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

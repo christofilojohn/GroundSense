@@ -79,6 +79,19 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     /// Last warning text that was spoken — suppresses exact duplicates.
     private var lastSpokenWarning: String = ""
 
+    // MARK: - Server-side TTS audio (edge-tts MP3)
+    /// Retains the AVAudioPlayer for the duration of playback — must be a stored
+    /// property or ARC will deallocate it immediately after play() returns.
+    private var audioPlayer: AVAudioPlayer?
+    /// Answer text waiting to be spoken — held until the MP3 arrives or the
+    /// fallback timer fires, whichever comes first.
+    private var pendingQueryAnswer: String = ""
+    /// True while a fallback query answer is being spoken via AVSpeechSynthesizer.
+    private var clearsPendingQueryAnswerOnSpeechEnd = false
+    /// Fires ~1.5 s after a query_response if no binary audio has arrived yet,
+    /// falling back to on-device AVSpeechSynthesizer.
+    private var audioFallbackTimer: Timer?
+
     // MARK: - STT
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -203,15 +216,18 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
     private func listenForMessages() {
         webSocket?.receive { [weak self] result in
-            switch result {
-            case .success(let message):
-                self?.handleServerMessage(message)
-                self?.listenForMessages()  // Continue listening
-            case .failure(let error):
-                print("WebSocket receive error: \(error)")
-                DispatchQueue.main.async {
-                    self?.isStreaming = false
-                    self?.statusMessage = "Connection lost"
+            // Always handle on main thread: @Published mutations, Timer scheduling,
+            // and pendingQueryAnswer access all require main-thread exclusivity.
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let message):
+                    self.handleServerMessage(message)
+                    self.listenForMessages()
+                case .failure(let error):
+                    print("WebSocket receive error: \(error)")
+                    self.isStreaming = false
+                    self.statusMessage = "Connection lost"
                 }
             }
         }
@@ -245,10 +261,9 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
                         bboxX2: bbox[2], bboxY2: bbox[3]
                     )
                 }
-                DispatchQueue.main.async { self.sceneObjects = parsed }
+                // Already on main thread — direct assignment is safe.
+                sceneObjects = parsed
 
-                // Haptic feedback — runs on the current (background) thread;
-                // HapticFeedbackManager is fully thread-safe.
                 if hapticsEnabled {
                     hapticManager.update(objects: parsed)
                 }
@@ -256,21 +271,80 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
             // ── Warnings & query responses ────────────────────────────
             if let warning = json["warning"] as? String {
-                // Visual banner always updates; speech is suppressed when muted.
-                DispatchQueue.main.async { self.lastSpokenText = warning }
+                lastSpokenText = warning
                 if !alertsMuted {
                     speakWithCooldown(warning)
                 }
             }
             if msgType == "query_response", let answer = json["answer"] as? String {
-                // Query responses always speak (they're user-initiated).
-                speakForced(answer)
+                lastSpokenText = answer
+
+                // Store the answer and arm a fallback timer.
+                // If the server's edge-tts audio arrives (binary message) before
+                // the timer fires, the timer is cancelled and the MP3 plays.
+                // If edge-tts is not installed on the server, no binary arrives
+                // and the timer falls back to on-device AVSpeechSynthesizer.
+                pendingQueryAnswer = answer
+                audioFallbackTimer?.invalidate()
+                audioFallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.5,
+                                                          repeats: false) { [weak self] _ in
+                    guard let self, !self.pendingQueryAnswer.isEmpty else { return }
+                    self.speakPendingQueryAnswerFallback()
+                }
             }
 
         case .data(let data):
-            print("Server binary data: \(data.count) bytes")
+            // Any binary message from the server is MP3 audio from edge-tts.
+            guard !data.isEmpty else { return }
+            audioFallbackTimer?.invalidate()
+            audioFallbackTimer = nil
+            playAudioResponse(data)
+
         @unknown default:
             break
+        }
+    }
+
+    // MARK: - Server audio playback
+
+    private func playAudioResponse(_ mp3Data: Data) {
+        // Already on main thread (called from handleServerMessage via listenForMessages).
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        audioPlayer?.stop()
+
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            // Deactivate first to cleanly exit .record mode (set by STT),
+            // then reconfigure for playback.
+            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+            try audioSession.setCategory(.playback, mode: .default, options: [])
+            try audioSession.setActive(true)
+
+            // fileTypeHint tells AVAudioPlayer the codec without needing a file URL.
+            audioPlayer = try AVAudioPlayer(data: mp3Data,
+                                            fileTypeHint: AVFileType.mp3.rawValue)
+            audioPlayer?.volume = 1.0
+            guard audioPlayer?.play() == true else {
+                throw NSError(domain: "ARCaptureManager.AudioPlayback",
+                              code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "AVAudioPlayer failed to start playback"])
+            }
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
+        } catch {
+            // If MP3 playback fails for any reason, fall back to on-device TTS.
+            print("AVAudioPlayer error: \(error) — falling back to AVSpeechSynthesizer")
+            speakPendingQueryAnswerFallback()
+        }
+    }
+
+    private func speakPendingQueryAnswerFallback() {
+        guard !pendingQueryAnswer.isEmpty else { return }
+        clearsPendingQueryAnswerOnSpeechEnd = true
+        speakForced(pendingQueryAnswer)
+        if !speechSynthesizer.isSpeaking {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
         }
     }
 
@@ -395,7 +469,9 @@ class ARCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         recognitionTask?.cancel()
         recognitionTask = nil
 
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // Don't deactivate the audio session here — if the server is about to
+        // send back MP3 audio, we need the session alive for playback.
+        // AVAudioSession will be reconfigured to .playback in playAudioResponse.
 
         DispatchQueue.main.async { self.isListening = false }
     }
@@ -696,11 +772,19 @@ extension ARCaptureManager: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                            didFinish utterance: AVSpeechUtterance) {
         lastSpeechEndTime = CACurrentMediaTime()
+        if clearsPendingQueryAnswerOnSpeechEnd {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
+        }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                            didCancel utterance: AVSpeechUtterance) {
         lastSpeechEndTime = CACurrentMediaTime()
+        if clearsPendingQueryAnswerOnSpeechEnd {
+            clearsPendingQueryAnswerOnSpeechEnd = false
+            pendingQueryAnswer = ""
+        }
     }
 }
 
