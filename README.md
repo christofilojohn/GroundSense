@@ -101,9 +101,3 @@ Binary WebSocket messages:
 | Meta JSON   | K bytes | UTF-8 JSON          |
 
 Metadata includes: `timestamp`, `rgbWidth`, `rgbHeight`, `depthWidth`, `depthHeight`, `intrinsics [fx, fy, cx, cy]`.
-
-## Team
-
-- **Ioannis**: iPhone capture, ARKit, LiDAR streaming, system integration
-- **Parth**: Segmentation pipeline, depth estimation, MobileSAM + Grounding DINO
-- **Antoni**: Query engine (Gemini LLM), obstacle avoidance, voice interface, evaluation
